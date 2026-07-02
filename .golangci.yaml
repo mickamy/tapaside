@@ -65,6 +65,7 @@ linters:
       - path: _test\.go
         linters:
           - gocyclo    # Each table case adds branches, so cyclomatic complexity climbs naturally and isn't a quality signal there.
+          - gosec      # Test inputs are author-controlled, not attacker-controlled; findings there (overflow conversions, dummy credentials) are noise.
           - maintidx   # Same: table-driven tests grow long by design and the maintainability index is not a useful signal there.
           - unparam    # Test helpers often take parameters with a single value today; keeping the signature is clearer than inlining.
 
