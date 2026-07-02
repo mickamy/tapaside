@@ -40,8 +40,8 @@ type Server struct {
 }
 
 // Serve accepts connections on l until ctx is canceled or the listener
-// is closed. Cancellation closes the listener; in-flight sessions are
-// not interrupted.
+// is closed; both count as a clean shutdown. Cancellation closes the
+// listener; in-flight sessions are not interrupted.
 func (s Server) Serve(ctx context.Context, l net.Listener) error {
 	if s.Handler == nil {
 		return errors.New("proxy: nil handler")
@@ -53,7 +53,7 @@ func (s Server) Serve(ctx context.Context, l net.Listener) error {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 

@@ -132,6 +132,29 @@ func TestServer_HandlerBridgesConnections(t *testing.T) {
 	}
 }
 
+func TestServer_ListenerClose(t *testing.T) {
+	t.Parallel()
+
+	l := listen(t)
+
+	noop := handlerFunc(func(context.Context, net.Conn, proxy.Dialer) error { return nil })
+	srv := proxy.Server{Upstream: "127.0.0.1:1", Handler: noop}
+
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(t.Context(), l) }()
+
+	_ = l.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Serve() = %v, want nil after listener close", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("Serve() did not return after listener close")
+	}
+}
+
 func TestServer_ContextCancel(t *testing.T) {
 	t.Parallel()
 
