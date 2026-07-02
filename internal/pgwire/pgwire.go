@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"slices"
 )
 
@@ -64,24 +65,27 @@ func (m StartupMessage) IsSSLRequest() bool { return m.Code == SSLRequestCode }
 
 func (m StartupMessage) IsGSSEncRequest() bool { return m.Code == GSSEncRequestCode }
 
-// WriteTo writes the message in wire format using a single Write call.
+// WriteTo writes the message in wire format. On a net.Conn the header
+// and payload go out in one writev call, without copying the payload
+// into a contiguous buffer.
 func (m StartupMessage) WriteTo(w io.Writer) (int64, error) {
 	length := 8 + len(m.Payload)
 	if length > maxStartupLength {
 		return 0, fmt.Errorf("pgwire: startup payload too large: %d bytes", len(m.Payload))
 	}
 
-	buf := make([]byte, length)
-	binary.BigEndian.PutUint32(buf[:4], uint32(length))
-	binary.BigEndian.PutUint32(buf[4:8], m.Code)
-	copy(buf[8:], m.Payload)
+	var head [8]byte
+	binary.BigEndian.PutUint32(head[:4], uint32(length))
+	binary.BigEndian.PutUint32(head[4:8], m.Code)
 
-	n, err := w.Write(buf)
+	bufs := net.Buffers{head[:], m.Payload}
+
+	n, err := bufs.WriteTo(w)
 	if err != nil {
-		return int64(n), fmt.Errorf("pgwire: write startup message: %w", err)
+		return n, fmt.Errorf("pgwire: write startup message: %w", err)
 	}
 
-	return int64(n), nil
+	return n, nil
 }
 
 // Message is a typed message exchanged after startup: 1 type byte,
@@ -137,22 +141,24 @@ func readPayload(r io.Reader, size int) ([]byte, error) {
 	return payload, nil
 }
 
-// WriteTo writes the message in wire format using a single Write call.
+// WriteTo writes the message in wire format. On a net.Conn the header
+// and payload go out in one writev call, without copying the payload
+// into a contiguous buffer.
 func (m Message) WriteTo(w io.Writer) (int64, error) {
 	length := 4 + len(m.Payload)
 	if length > maxMessageLength {
 		return 0, fmt.Errorf("pgwire: message payload too large: %d bytes", len(m.Payload))
 	}
 
-	buf := make([]byte, 1+length)
-	buf[0] = m.Type
-	binary.BigEndian.PutUint32(buf[1:5], uint32(length))
-	copy(buf[5:], m.Payload)
+	head := [5]byte{m.Type}
+	binary.BigEndian.PutUint32(head[1:5], uint32(length))
 
-	n, err := w.Write(buf)
+	bufs := net.Buffers{head[:], m.Payload}
+
+	n, err := bufs.WriteTo(w)
 	if err != nil {
-		return int64(n), fmt.Errorf("pgwire: write message: %w", err)
+		return n, fmt.Errorf("pgwire: write message: %w", err)
 	}
 
-	return int64(n), nil
+	return n, nil
 }
