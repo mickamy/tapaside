@@ -1,0 +1,286 @@
+package pgwire_test
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+
+	"github.com/mickamy/tapaside/internal/pgwire"
+)
+
+func startupBytes(code uint32, payload []byte) []byte {
+	buf := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint32(buf[:4], uint32(len(buf)))
+	binary.BigEndian.PutUint32(buf[4:8], code)
+	copy(buf[8:], payload)
+
+	return buf
+}
+
+func messageBytes(typ byte, payload []byte) []byte {
+	buf := make([]byte, 5+len(payload))
+	buf[0] = typ
+	binary.BigEndian.PutUint32(buf[1:5], uint32(4+len(payload)))
+	copy(buf[5:], payload)
+
+	return buf
+}
+
+func TestReadStartup(t *testing.T) {
+	t.Parallel()
+
+	startupPayload := []byte("user\x00alice\x00database\x00app\x00\x00")
+	cancelPayload := []byte{0, 0, 0, 1, 0, 0, 0, 2} // pid, secret key
+
+	tests := []struct {
+		name    string
+		input   []byte
+		want    pgwire.StartupMessage
+		wantErr string
+	}{
+		{
+			name:  "startup message v3.0",
+			input: startupBytes(196608, startupPayload),
+			want:  pgwire.StartupMessage{Code: 196608, Payload: startupPayload},
+		},
+		{
+			name:  "ssl request",
+			input: startupBytes(pgwire.SSLRequestCode, nil),
+			want:  pgwire.StartupMessage{Code: pgwire.SSLRequestCode, Payload: []byte{}},
+		},
+		{
+			name:  "gssenc request",
+			input: startupBytes(pgwire.GSSEncRequestCode, nil),
+			want:  pgwire.StartupMessage{Code: pgwire.GSSEncRequestCode, Payload: []byte{}},
+		},
+		{
+			name:  "cancel request",
+			input: startupBytes(pgwire.CancelRequestCode, cancelPayload),
+			want:  pgwire.StartupMessage{Code: pgwire.CancelRequestCode, Payload: cancelPayload},
+		},
+		{
+			name:    "length below minimum",
+			input:   []byte{0, 0, 0, 4, 0, 0, 0, 0},
+			wantErr: "pgwire: invalid startup packet length",
+		},
+		{
+			name:    "length above maximum",
+			input:   []byte{0, 0, 0x27, 0x11, 0, 0, 0, 0}, // 10001
+			wantErr: "pgwire: invalid startup packet length",
+		},
+		{
+			name:    "truncated payload",
+			input:   startupBytes(196608, startupPayload)[:12],
+			wantErr: "pgwire: read startup payload",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := pgwire.ReadStartup(bytes.NewReader(tt.input))
+
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("ReadStartup() error = %v, want substring %q", err, tt.wantErr)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("ReadStartup() error = %v", err)
+			}
+			if got.Code != tt.want.Code {
+				t.Errorf("Code = %d, want %d", got.Code, tt.want.Code)
+			}
+			if !bytes.Equal(got.Payload, tt.want.Payload) {
+				t.Errorf("Payload = %q, want %q", got.Payload, tt.want.Payload)
+			}
+		})
+	}
+}
+
+func TestReadStartup_EOF(t *testing.T) {
+	t.Parallel()
+
+	_, err := pgwire.ReadStartup(bytes.NewReader(nil))
+
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("ReadStartup() error = %v, want io.EOF", err)
+	}
+}
+
+func TestStartupMessage_Requests(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		code       uint32
+		wantSSL    bool
+		wantGSS    bool
+		wantCancel bool
+	}{
+		{name: "protocol v3.0", code: 196608},
+		{name: "ssl request", code: pgwire.SSLRequestCode, wantSSL: true},
+		{name: "gssenc request", code: pgwire.GSSEncRequestCode, wantGSS: true},
+		{name: "cancel request", code: pgwire.CancelRequestCode, wantCancel: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := pgwire.StartupMessage{Code: tt.code}
+
+			if got := m.IsSSLRequest(); got != tt.wantSSL {
+				t.Errorf("IsSSLRequest() = %v, want %v", got, tt.wantSSL)
+			}
+			if got := m.IsGSSEncRequest(); got != tt.wantGSS {
+				t.Errorf("IsGSSEncRequest() = %v, want %v", got, tt.wantGSS)
+			}
+			if got := m.IsCancelRequest(); got != tt.wantCancel {
+				t.Errorf("IsCancelRequest() = %v, want %v", got, tt.wantCancel)
+			}
+		})
+	}
+}
+
+func TestStartupMessage_WriteTo(t *testing.T) {
+	t.Parallel()
+
+	t.Run("round trip", func(t *testing.T) {
+		t.Parallel()
+
+		m := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+
+		var buf bytes.Buffer
+
+		n, err := m.WriteTo(&buf)
+		if err != nil {
+			t.Fatalf("WriteTo() error = %v", err)
+		}
+		if n != int64(buf.Len()) {
+			t.Errorf("WriteTo() = %d, want %d", n, buf.Len())
+		}
+
+		got, err := pgwire.ReadStartup(&buf)
+		if err != nil {
+			t.Fatalf("ReadStartup() error = %v", err)
+		}
+		if got.Code != m.Code || !bytes.Equal(got.Payload, m.Payload) {
+			t.Errorf("round trip = %+v, want %+v", got, m)
+		}
+	})
+
+	t.Run("payload too large", func(t *testing.T) {
+		t.Parallel()
+
+		m := pgwire.StartupMessage{Code: 196608, Payload: make([]byte, 10000)}
+
+		if _, err := m.WriteTo(io.Discard); err == nil {
+			t.Error("WriteTo() error = nil, want error")
+		}
+	})
+}
+
+func TestReadMessage(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		input   []byte
+		want    pgwire.Message
+		wantErr string
+	}{
+		{
+			name:  "simple query",
+			input: messageBytes('Q', []byte("SELECT 1\x00")),
+			want:  pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")},
+		},
+		{
+			name:  "empty payload",
+			input: messageBytes('S', nil),
+			want:  pgwire.Message{Type: 'S', Payload: []byte{}},
+		},
+		{
+			name:    "length below minimum",
+			input:   []byte{'Q', 0, 0, 0, 3},
+			wantErr: "pgwire: invalid message length",
+		},
+		{
+			name:    "length above maximum",
+			input:   []byte{'Q', 0x40, 0, 0, 1}, // 1<<30 + 1
+			wantErr: "pgwire: invalid message length",
+		},
+		{
+			name:    "truncated payload",
+			input:   messageBytes('Q', []byte("SELECT 1\x00"))[:8],
+			wantErr: "pgwire: read message payload",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := pgwire.ReadMessage(bytes.NewReader(tt.input))
+
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("ReadMessage() error = %v, want substring %q", err, tt.wantErr)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("ReadMessage() error = %v", err)
+			}
+			if got.Type != tt.want.Type {
+				t.Errorf("Type = %c, want %c", got.Type, tt.want.Type)
+			}
+			if !bytes.Equal(got.Payload, tt.want.Payload) {
+				t.Errorf("Payload = %q, want %q", got.Payload, tt.want.Payload)
+			}
+		})
+	}
+}
+
+func TestReadMessage_EOF(t *testing.T) {
+	t.Parallel()
+
+	_, err := pgwire.ReadMessage(bytes.NewReader(nil))
+
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("ReadMessage() error = %v, want io.EOF", err)
+	}
+}
+
+func TestMessage_WriteTo(t *testing.T) {
+	t.Parallel()
+
+	m := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+
+	var buf bytes.Buffer
+
+	n, err := m.WriteTo(&buf)
+	if err != nil {
+		t.Fatalf("WriteTo() error = %v", err)
+	}
+	if n != int64(buf.Len()) {
+		t.Errorf("WriteTo() = %d, want %d", n, buf.Len())
+	}
+
+	got, err := pgwire.ReadMessage(&buf)
+	if err != nil {
+		t.Fatalf("ReadMessage() error = %v", err)
+	}
+	if got.Type != m.Type || !bytes.Equal(got.Payload, m.Payload) {
+		t.Errorf("round trip = %+v, want %+v", got, m)
+	}
+}

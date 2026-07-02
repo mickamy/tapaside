@@ -1,0 +1,130 @@
+// Package pgwire implements minimal framing for the PostgreSQL
+// frontend/backend protocol (version 3.0).
+package pgwire
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+)
+
+// Special request codes sent in place of a protocol version during the
+// startup phase.
+const (
+	CancelRequestCode = 80877102
+	SSLRequestCode    = 80877103
+	GSSEncRequestCode = 80877104
+)
+
+const (
+	// maxStartupLength mirrors PostgreSQL's MAX_STARTUP_PACKET_LENGTH.
+	maxStartupLength = 10000
+	// maxMessageLength mirrors PostgreSQL's 1 GB message size limit.
+	maxMessageLength = 1 << 30
+)
+
+var (
+	_ io.WriterTo = StartupMessage{}
+	_ io.WriterTo = Message{}
+)
+
+// StartupMessage is an untyped message sent by the client before the
+// session is established: int32 length (self-inclusive), int32 request
+// code (protocol version or one of the special request codes), payload.
+type StartupMessage struct {
+	Code    uint32
+	Payload []byte
+}
+
+// ReadStartup reads one startup-phase message from r.
+func ReadStartup(r io.Reader) (StartupMessage, error) {
+	var head [8]byte
+	if _, err := io.ReadFull(r, head[:]); err != nil {
+		return StartupMessage{}, fmt.Errorf("pgwire: read startup header: %w", err)
+	}
+
+	length := binary.BigEndian.Uint32(head[:4])
+	if length < 8 || length > maxStartupLength {
+		return StartupMessage{}, fmt.Errorf("pgwire: invalid startup packet length %d", length)
+	}
+
+	payload := make([]byte, length-8)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return StartupMessage{}, fmt.Errorf("pgwire: read startup payload: %w", err)
+	}
+
+	return StartupMessage{Code: binary.BigEndian.Uint32(head[4:8]), Payload: payload}, nil
+}
+
+func (m StartupMessage) IsCancelRequest() bool { return m.Code == CancelRequestCode }
+
+func (m StartupMessage) IsSSLRequest() bool { return m.Code == SSLRequestCode }
+
+func (m StartupMessage) IsGSSEncRequest() bool { return m.Code == GSSEncRequestCode }
+
+// WriteTo writes the message in wire format using a single Write call.
+func (m StartupMessage) WriteTo(w io.Writer) (int64, error) {
+	length := 8 + len(m.Payload)
+	if length > maxStartupLength {
+		return 0, fmt.Errorf("pgwire: startup payload too large: %d bytes", len(m.Payload))
+	}
+
+	buf := make([]byte, length)
+	binary.BigEndian.PutUint32(buf[:4], uint32(length))
+	binary.BigEndian.PutUint32(buf[4:8], m.Code)
+	copy(buf[8:], m.Payload)
+
+	n, err := w.Write(buf)
+	if err != nil {
+		return int64(n), fmt.Errorf("pgwire: write startup message: %w", err)
+	}
+
+	return int64(n), nil
+}
+
+// Message is a typed message exchanged after startup: 1 type byte,
+// int32 length (self-inclusive, excluding the type byte), payload.
+type Message struct {
+	Type    byte
+	Payload []byte
+}
+
+// ReadMessage reads one typed message from r.
+func ReadMessage(r io.Reader) (Message, error) {
+	var head [5]byte
+	if _, err := io.ReadFull(r, head[:]); err != nil {
+		return Message{}, fmt.Errorf("pgwire: read message header: %w", err)
+	}
+
+	length := binary.BigEndian.Uint32(head[1:5])
+	if length < 4 || length > maxMessageLength {
+		return Message{}, fmt.Errorf("pgwire: invalid message length %d", length)
+	}
+
+	payload := make([]byte, length-4)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return Message{}, fmt.Errorf("pgwire: read message payload: %w", err)
+	}
+
+	return Message{Type: head[0], Payload: payload}, nil
+}
+
+// WriteTo writes the message in wire format using a single Write call.
+func (m Message) WriteTo(w io.Writer) (int64, error) {
+	length := 4 + len(m.Payload)
+	if length > maxMessageLength {
+		return 0, fmt.Errorf("pgwire: message payload too large: %d bytes", len(m.Payload))
+	}
+
+	buf := make([]byte, 1+length)
+	buf[0] = m.Type
+	binary.BigEndian.PutUint32(buf[1:5], uint32(length))
+	copy(buf[5:], m.Payload)
+
+	n, err := w.Write(buf)
+	if err != nil {
+		return int64(n), fmt.Errorf("pgwire: write message: %w", err)
+	}
+
+	return int64(n), nil
+}
