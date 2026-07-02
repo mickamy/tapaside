@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"syscall"
 	"time"
 )
 
@@ -40,9 +41,11 @@ type Server struct {
 }
 
 // Serve accepts connections on l until ctx is canceled or the listener
-// is closed; both count as a clean shutdown. Cancellation closes the
-// listener; in-flight sessions run detached from ctx so they are not
-// interrupted, and they end when either side closes the connection.
+// is closed; both count as a clean shutdown. Temporary accept failures
+// (e.g., file descriptor exhaustion) are retried with backoff instead
+// of stopping the proxy. Cancellation closes the listener; in-flight
+// sessions run detached from ctx so they are not interrupted, and they
+// end when either side closes the connection.
 func (s Server) Serve(ctx context.Context, l net.Listener) error {
 	if s.Handler == nil {
 		return errors.New("proxy: nil handler")
@@ -51,6 +54,8 @@ func (s Server) Serve(ctx context.Context, l net.Listener) error {
 	stop := context.AfterFunc(ctx, func() { _ = l.Close() })
 	defer stop()
 
+	var delay time.Duration
+
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -58,8 +63,30 @@ func (s Server) Serve(ctx context.Context, l net.Listener) error {
 				return nil
 			}
 
+			// The runtime already retries EINTR and ECONNABORTED inside
+			// Accept, and no deadline is set on the listener, so the only
+			// transient failure that reaches us is fd exhaustion.
+			if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) {
+				if delay == 0 {
+					delay = 5 * time.Millisecond
+				} else {
+					delay = min(delay*2, time.Second)
+				}
+
+				s.logf("accept: %v; retrying in %v\n", err, delay)
+
+				select {
+				case <-time.After(delay):
+					continue
+				case <-ctx.Done():
+					return nil
+				}
+			}
+
 			return fmt.Errorf("proxy: accept: %w", err)
 		}
+
+		delay = 0
 
 		go s.handle(context.WithoutCancel(ctx), conn)
 	}

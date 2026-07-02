@@ -2,9 +2,12 @@ package proxy_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -58,6 +61,60 @@ func dialProxy(t *testing.T, addr string) net.Conn {
 	}
 
 	return conn
+}
+
+type acceptResult struct {
+	conn net.Conn
+	err  error
+}
+
+// stubListener replays scripted Accept results; once the script is
+// exhausted it reports net.ErrClosed like a closed listener.
+type stubListener struct {
+	accepts chan acceptResult
+}
+
+func (l *stubListener) Accept() (net.Conn, error) {
+	r, ok := <-l.accepts
+	if !ok {
+		return nil, net.ErrClosed
+	}
+
+	return r.conn, r.err
+}
+
+func (l *stubListener) Close() error   { return nil }
+func (l *stubListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+func TestServer_AcceptRetriesTemporaryErrors(t *testing.T) {
+	t.Parallel()
+
+	accepts := make(chan acceptResult, 2)
+	accepts <- acceptResult{err: fmt.Errorf("accept: %w", syscall.EMFILE)}
+	accepts <- acceptResult{err: fmt.Errorf("accept: %w", syscall.ENFILE)}
+	close(accepts)
+
+	noop := handlerFunc(func(context.Context, net.Conn, proxy.Dialer) error { return nil })
+	srv := proxy.Server{Upstream: "127.0.0.1:1", Handler: noop}
+
+	if err := srv.Serve(t.Context(), &stubListener{accepts: accepts}); err != nil {
+		t.Errorf("Serve() = %v, want nil (temporary errors retried, then clean close)", err)
+	}
+}
+
+func TestServer_AcceptFatalError(t *testing.T) {
+	t.Parallel()
+
+	accepts := make(chan acceptResult, 1)
+	accepts <- acceptResult{err: errors.New("boom")}
+
+	noop := handlerFunc(func(context.Context, net.Conn, proxy.Dialer) error { return nil })
+	srv := proxy.Server{Upstream: "127.0.0.1:1", Handler: noop}
+
+	err := srv.Serve(t.Context(), &stubListener{accepts: accepts})
+	if err == nil || !strings.Contains(err.Error(), "accept") {
+		t.Errorf("Serve() = %v, want wrapped accept error", err)
+	}
 }
 
 func TestServer_NilHandler(t *testing.T) {
