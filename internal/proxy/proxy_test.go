@@ -132,6 +132,48 @@ func TestServer_HandlerBridgesConnections(t *testing.T) {
 	}
 }
 
+func TestServer_CancelDetachesSessions(t *testing.T) {
+	t.Parallel()
+
+	l := listen(t)
+	ctx, cancel := context.WithCancel(t.Context())
+
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	got := make(chan error, 1)
+
+	h := handlerFunc(func(hctx context.Context, _ net.Conn, _ proxy.Dialer) error {
+		close(started)
+		<-canceled
+		got <- hctx.Err()
+
+		return nil
+	})
+
+	srv := proxy.Server{Upstream: "127.0.0.1:1", Handler: h}
+	go func() { _ = srv.Serve(ctx, l) }()
+
+	dialProxy(t, l.Addr().String())
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not start")
+	}
+
+	cancel()
+	close(canceled)
+
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Errorf("session ctx err = %v, want nil after server cancel", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("session did not report")
+	}
+}
+
 func TestServer_ListenerClose(t *testing.T) {
 	t.Parallel()
 

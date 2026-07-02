@@ -41,7 +41,8 @@ type Server struct {
 
 // Serve accepts connections on l until ctx is canceled or the listener
 // is closed; both count as a clean shutdown. Cancellation closes the
-// listener; in-flight sessions are not interrupted.
+// listener; in-flight sessions run detached from ctx so they are not
+// interrupted, and they end when either side closes the connection.
 func (s Server) Serve(ctx context.Context, l net.Listener) error {
 	if s.Handler == nil {
 		return errors.New("proxy: nil handler")
@@ -60,7 +61,7 @@ func (s Server) Serve(ctx context.Context, l net.Listener) error {
 			return fmt.Errorf("proxy: accept: %w", err)
 		}
 
-		go s.handle(ctx, conn)
+		go s.handle(context.WithoutCancel(ctx), conn)
 	}
 }
 
