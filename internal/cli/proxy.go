@@ -1,28 +1,74 @@
 package cli
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"io"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/mickamy/tapaside/internal/exit"
+	"github.com/mickamy/tapaside/internal/proxy"
+	"github.com/mickamy/tapaside/internal/proxy/pg"
 )
 
 func runProxy(args []string, stdout, stderr io.Writer) int {
-	return notImplemented(args, stdout, stderr)
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() { printProxyUsage(stderr) }
+
+	listen := fs.String("listen", "127.0.0.1:5433", "address to listen on")
+	upstream := fs.String("upstream", "", "upstream database address (required)")
+
+	if err := fs.Parse(args); err != nil {
+		return exit.Usage
+	}
+
+	if *upstream == "" {
+		fmt.Fprintln(stderr, "tapaside: --upstream is required")
+		fmt.Fprintln(stderr, "Run 'tapaside proxy --help' for usage.")
+
+		return exit.Usage
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var lc net.ListenConfig
+	l, err := lc.Listen(ctx, "tcp", *listen)
+	if err != nil {
+		fmt.Fprintf(stderr, "tapaside: %v\n", err)
+
+		return exit.Error
+	}
+
+	fmt.Fprintf(stdout, "tapaside proxy listening on %s, upstream %s\n", l.Addr(), *upstream)
+
+	srv := proxy.Server{Upstream: *upstream, Handler: pg.Handler{}, Log: stderr}
+	if err := srv.Serve(ctx, l); err != nil {
+		fmt.Fprintf(stderr, "tapaside: %v\n", err)
+
+		return exit.Error
+	}
+
+	return exit.OK
 }
 
 func printProxyUsage(w io.Writer) {
-	fmt.Fprintln(w, "tapaside proxy — run the sidecar proxy in front of PostgreSQL/MySQL/TiDB.")
+	fmt.Fprintln(w, "tapaside proxy — run the sidecar proxy in front of PostgreSQL.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "USAGE:")
 	fmt.Fprintln(w, "  tapaside proxy --upstream <addr> [flags]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Listens on loopback for plaintext client connections, connects to the upstream")
-	fmt.Fprintln(w, "database over TLS (verify-full), evaluates policy locally before each query,")
-	fmt.Fprintln(w, "and writes an audit record for every decision.")
+	fmt.Fprintln(w, "Listens on loopback for plaintext client connections and relays each")
+	fmt.Fprintln(w, "session to the upstream database. Policy enforcement and audit output")
+	fmt.Fprintln(w, "will land here.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "FLAGS:")
 	fmt.Fprintln(w, "  --listen <addr>     Address to listen on (default: 127.0.0.1:5433)")
 	fmt.Fprintln(w, "  --upstream <addr>   Upstream database address (required)")
-	fmt.Fprintln(w, "  --policy <file>     Policy file to enforce")
-	fmt.Fprintln(w, "  --audit <file>      Append audit records (JSONL) to this file")
 	fmt.Fprintln(w, "  --help, -h          Show this help")
 }

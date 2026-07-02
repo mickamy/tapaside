@@ -43,6 +43,24 @@ func TestRun(t *testing.T) {
 			wantCode:   exit.NotImplemented,
 			wantStderr: "not implemented",
 		},
+		{
+			name:       "proxy requires upstream",
+			args:       []string{"proxy"},
+			wantCode:   exit.Usage,
+			wantStderr: "--upstream is required",
+		},
+		{
+			name:       "proxy rejects unknown flag",
+			args:       []string{"proxy", "--nope"},
+			wantCode:   exit.Usage,
+			wantStderr: "flag provided but not defined",
+		},
+		{
+			name:       "proxy rejects bad listen address",
+			args:       []string{"proxy", "--upstream", "127.0.0.1:5432", "--listen", "definitely-not-an-address"},
+			wantCode:   exit.Error,
+			wantStderr: "tapaside:",
+		},
 	}
 
 	for _, tt := range tests {

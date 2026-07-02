@@ -100,8 +100,8 @@ func PrintUsage(w io.Writer) {
 
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "EXAMPLES:")
-	fmt.Fprintln(w, "  # Run a sidecar in front of PostgreSQL, enforcing policy.yaml")
-	fmt.Fprintln(w, "  tapaside proxy --listen 127.0.0.1:5433 --upstream db.internal:5432 --policy policy.yaml")
+	fmt.Fprintln(w, "  # Run a sidecar in front of PostgreSQL")
+	fmt.Fprintln(w, "  tapaside proxy --listen 127.0.0.1:5433 --upstream db.internal:5432")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  # Validate a policy file before deploying it")
 	fmt.Fprintln(w, "  tapaside policy check policy.yaml")
