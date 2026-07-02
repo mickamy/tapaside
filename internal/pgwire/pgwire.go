@@ -4,8 +4,10 @@ package pgwire
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"slices"
 )
 
 // Special request codes sent in place of a protocol version during the
@@ -101,12 +103,38 @@ func ReadMessage(r io.Reader) (Message, error) {
 		return Message{}, fmt.Errorf("pgwire: invalid message length %d", length)
 	}
 
-	payload := make([]byte, length-4)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return Message{}, fmt.Errorf("pgwire: read message payload: %w", err)
+	payload, err := readPayload(r, int(length-4))
+	if err != nil {
+		return Message{}, err
 	}
 
 	return Message{Type: head[0], Payload: payload}, nil
+}
+
+// readPayload reads size bytes from r, growing the buffer as bytes
+// arrive instead of trusting size up front, so a peer cannot force a
+// large allocation with a small header alone. A stream that ends
+// mid-payload reports io.ErrUnexpectedEOF, even at a chunk boundary.
+func readPayload(r io.Reader, size int) ([]byte, error) {
+	const chunk = 64 << 10
+
+	payload := make([]byte, 0, min(size, chunk))
+
+	for len(payload) < size {
+		n := min(size-len(payload), chunk)
+		start := len(payload)
+		payload = slices.Grow(payload, n)[:start+n]
+
+		if _, err := io.ReadFull(r, payload[start:]); err != nil {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+
+			return nil, fmt.Errorf("pgwire: read message payload: %w", err)
+		}
+	}
+
+	return payload, nil
 }
 
 // WriteTo writes the message in wire format using a single Write call.

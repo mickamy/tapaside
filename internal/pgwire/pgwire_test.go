@@ -251,6 +251,37 @@ func TestReadMessage(t *testing.T) {
 	}
 }
 
+func TestReadMessage_LargePayload(t *testing.T) {
+	t.Parallel()
+
+	// Larger than the 64 KiB read chunk so the payload spans several reads.
+	payload := bytes.Repeat([]byte{0xAB}, 200<<10)
+
+	got, err := pgwire.ReadMessage(bytes.NewReader(messageBytes('d', payload)))
+	if err != nil {
+		t.Fatalf("ReadMessage() error = %v", err)
+	}
+	if got.Type != 'd' || !bytes.Equal(got.Payload, payload) {
+		t.Errorf("ReadMessage() = type %c payload %d bytes, want type d payload %d bytes",
+			got.Type, len(got.Payload), len(payload))
+	}
+}
+
+func TestReadMessage_TruncatedAtChunkBoundary(t *testing.T) {
+	t.Parallel()
+
+	// The stream ends exactly at a 64 KiB chunk boundary; this must not
+	// look like a clean close between messages.
+	full := messageBytes('Q', make([]byte, 128<<10))
+	input := full[:5+(64<<10)]
+
+	_, err := pgwire.ReadMessage(bytes.NewReader(input))
+
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("ReadMessage() error = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
 func TestReadMessage_EOF(t *testing.T) {
 	t.Parallel()
 
