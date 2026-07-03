@@ -27,8 +27,8 @@ const (
 )
 
 var (
-	_ io.WriterTo = StartupMessage{}
-	_ io.WriterTo = Message{}
+	_ io.WriterTo = (*StartupMessage)(nil)
+	_ io.WriterTo = (*Message)(nil)
 )
 
 // StartupMessage is an untyped message sent by the client before the

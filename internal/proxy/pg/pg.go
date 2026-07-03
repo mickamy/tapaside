@@ -25,7 +25,7 @@ const maxStartupReads = 3
 // and audit output will land here.
 type Handler struct{}
 
-var _ proxy.Handler = Handler{}
+var _ proxy.Handler = (*Handler)(nil)
 
 // ServeConn implements proxy.Handler.
 func (h Handler) ServeConn(ctx context.Context, client net.Conn, dial proxy.Dialer) error {
