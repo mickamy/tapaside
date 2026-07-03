@@ -222,7 +222,7 @@ const (
 // It reports halfClose only for a clean EOF on a message boundary — the
 // one case where the client deliberately shut down its write side and
 // may still be waiting for responses.
-func copyMessages(upstream, clientW io.Writer, src io.Reader, pol policy.Policy) (halfClose bool, _ error) {
+func copyMessages(upstream io.Writer, clientW *syncWriter, src io.Reader, pol policy.Policy) (halfClose bool, _ error) {
 	f := msgFilter{clientW: clientW, pol: pol, enforce: pol.Enforces()}
 
 	for {
@@ -264,7 +264,7 @@ func copyMessages(upstream, clientW io.Writer, src io.Reader, pol policy.Policy)
 // unsupported ones directly on the client and tracking the extended
 // protocol's skip-until-Sync recovery state across messages.
 type msgFilter struct {
-	clientW io.Writer
+	clientW *syncWriter
 	pol     policy.Policy
 	enforce bool
 	// skipUntilSync is set after an extended-protocol batch is refused;
@@ -281,7 +281,7 @@ func (f *msgFilter) handle(m pgwire.Message) (bool, error) {
 		if m.Type == msgSync {
 			f.skipUntilSync = false
 
-			return true, writeReady(f.clientW)
+			return true, f.clientW.writeMessage(pgwire.ReadyForQuery('I'))
 		}
 
 		return true, nil // discard everything until the batch ends
@@ -289,7 +289,7 @@ func (f *msgFilter) handle(m pgwire.Message) (bool, error) {
 
 	if m.IsQuery() {
 		if res := f.pol.Evaluate(m.QueryText()); res.Decision == policy.Blocked {
-			return true, denyQuery(f.clientW, res)
+			return true, f.denyQuery(res)
 		}
 
 		return false, nil
@@ -304,14 +304,14 @@ func (f *msgFilter) handle(m pgwire.Message) (bool, error) {
 		// Refuse the whole batch, then swallow up to its Sync.
 		f.skipUntilSync = true
 
-		return true, writeError(f.clientW, "0A000", extendedNotSupported)
+		return true, f.clientW.writeMessage(pgwire.ErrorResponse("0A000", extendedNotSupported))
 	case msgFunctionCall:
 		// Fast-path is not followed by Sync; answer it on its own.
-		if err := writeError(f.clientW, "0A000", fastPathNotSupported); err != nil {
+		if err := f.clientW.writeMessage(pgwire.ErrorResponse("0A000", fastPathNotSupported)); err != nil {
 			return true, err
 		}
 
-		return true, writeReady(f.clientW)
+		return true, f.clientW.writeMessage(pgwire.ReadyForQuery('I'))
 	}
 
 	return false, nil
@@ -326,47 +326,48 @@ const (
 // denyQuery answers a blocked simple query the way the backend answers a
 // rejected statement: an ErrorResponse followed by ReadyForQuery so the
 // client leaves its busy state and can send the next query.
-func denyQuery(w io.Writer, res policy.Result) error {
+func (f *msgFilter) denyQuery(res policy.Result) error {
 	// 42501 is insufficient_privilege, the closest standard SQLSTATE for
 	// "the gateway refused this", and one clients surface as a normal
 	// permission error rather than a connection fault.
-	if err := writeError(w, "42501", fmt.Sprintf("blocked by tapaside policy (%s)", res.Rule)); err != nil {
+	msg := fmt.Sprintf("blocked by tapaside policy (%s)", res.Rule)
+	if err := f.clientW.writeMessage(pgwire.ErrorResponse("42501", msg)); err != nil {
 		return err
 	}
 
-	return writeReady(w)
-}
-
-func writeError(w io.Writer, code, message string) error {
-	if _, err := pgwire.ErrorResponse(code, message).WriteTo(w); err != nil {
-		return fmt.Errorf("pg: write error response: %w", err)
-	}
-
-	return nil
-}
-
-func writeReady(w io.Writer) error {
-	if _, err := pgwire.ReadyForQuery('I').WriteTo(w); err != nil {
-		return fmt.Errorf("pg: write ready for query: %w", err)
-	}
-
-	return nil
+	return f.clientW.writeMessage(pgwire.ReadyForQuery('I'))
 }
 
 // syncWriter serializes concurrent writes to the client connection.
-// Both relay directions target it, so its lock keeps the upstream copy
-// and a synthetic deny response from interleaving. Errors pass through
-// unwrapped; callers add context.
+// Both relay directions target it: the raw upstream→client copy and the
+// synthetic responses for blocked queries. Its lock keeps them from
+// interleaving.
 type syncWriter struct {
 	mu sync.Mutex
 	w  io.Writer
 }
 
+// Write serializes a raw byte slice from the upstream→client copy.
 func (w *syncWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	return w.w.Write(p) //nolint:wrapcheck // thin serializing wrapper; callers wrap with context
+}
+
+// writeMessage writes a whole protocol message in one locked Write, so
+// no concurrent upstream bytes can land between its header and payload.
+// Message.WriteTo cannot promise this: on a plain io.Writer net.Buffers
+// falls back to one Write per buffer, releasing the lock in between.
+func (w *syncWriter) writeMessage(m pgwire.Message) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if _, err := w.w.Write(m.Bytes()); err != nil {
+		return fmt.Errorf("pg: write client message: %w", err)
+	}
+
+	return nil
 }
 
 // isDisconnect reports whether err is one of the errors a vanished or
