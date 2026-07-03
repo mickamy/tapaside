@@ -66,8 +66,14 @@ func TestRun(t *testing.T) {
 			wantStderr: "flag provided but not defined",
 		},
 		{
-			name:       "proxy rejects bad listen address",
+			name:       "proxy rejects malformed listen address",
 			args:       []string{"proxy", "--upstream", "127.0.0.1:5432", "--listen", "definitely-not-an-address"},
+			wantCode:   exit.Usage,
+			wantStderr: "invalid --listen",
+		},
+		{
+			name:       "proxy reports unbindable listen address",
+			args:       []string{"proxy", "--upstream", "127.0.0.1:5432", "--listen", "256.256.256.256:5433"},
 			wantCode:   exit.Error,
 			wantStderr: "tapaside:",
 		},

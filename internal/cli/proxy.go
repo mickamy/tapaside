@@ -52,6 +52,13 @@ func runProxy(args []string, stdout, stderr io.Writer) int {
 		return exit.Usage
 	}
 
+	if _, _, err := net.SplitHostPort(*listen); err != nil {
+		fmt.Fprintf(stderr, "tapaside: invalid --listen %q: %v\n", *listen, err)
+		fmt.Fprintln(stderr, "Run 'tapaside proxy --help' for usage.")
+
+		return exit.Usage
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
