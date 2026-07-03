@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime/debug"
 	"syscall"
 	"time"
 )
@@ -94,6 +95,11 @@ func (s Server) Serve(ctx context.Context, l net.Listener) error {
 
 func (s Server) handle(ctx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
+	defer func() {
+		if r := recover(); r != nil {
+			s.logf("session %s: panic: %v\n%s", conn.RemoteAddr(), r, debug.Stack())
+		}
+	}()
 
 	err := s.Handler.ServeConn(ctx, conn, s.dial)
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {

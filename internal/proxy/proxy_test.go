@@ -1,12 +1,14 @@
 package proxy_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -114,6 +116,55 @@ func TestServer_AcceptFatalError(t *testing.T) {
 	err := srv.Serve(t.Context(), &stubListener{accepts: accepts})
 	if err == nil || !strings.Contains(err.Error(), "accept") {
 		t.Errorf("Serve() = %v, want wrapped accept error", err)
+	}
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	n, _ := b.buf.Write(p) // bytes.Buffer.Write never returns an error
+
+	return n, nil
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+func TestServer_HandlerPanicIsContained(t *testing.T) {
+	t.Parallel()
+
+	l := listen(t)
+
+	var log syncBuffer
+
+	h := handlerFunc(func(context.Context, net.Conn, proxy.Dialer) error {
+		panic("handler exploded")
+	})
+	srv := proxy.Server{Upstream: "127.0.0.1:1", Handler: h, Log: &log}
+	go func() { _ = srv.Serve(t.Context(), l) }()
+
+	// The second session proves the server survived the first panic.
+	for range 2 {
+		conn := dialProxy(t, l.Addr().String())
+
+		buf := make([]byte, 1)
+		if _, err := conn.Read(buf); !errors.Is(err, io.EOF) {
+			t.Fatalf("read = %v, want io.EOF after handler panic", err)
+		}
+	}
+
+	if !strings.Contains(log.String(), "panic") {
+		t.Errorf("log = %q, want it to mention the panic", log.String())
 	}
 }
 
