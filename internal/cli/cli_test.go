@@ -38,6 +38,12 @@ func TestRun(t *testing.T) {
 			wantStdout: "tapaside proxy",
 		},
 		{
+			name:       "subcommand help with single dash",
+			args:       []string{"proxy", "-help"},
+			wantCode:   exit.OK,
+			wantStdout: "tapaside proxy",
+		},
+		{
 			name:       "subcommand not implemented",
 			args:       []string{"audit", "tail"},
 			wantCode:   exit.NotImplemented,

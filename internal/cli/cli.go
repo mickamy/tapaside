@@ -72,7 +72,7 @@ func lookup(name string) (subcommand, bool) {
 
 func wantsHelp(args []string) bool {
 	for _, a := range args {
-		if a == "--help" || a == "-h" {
+		if a == "--help" || a == "-help" || a == "-h" {
 			return true
 		}
 	}
