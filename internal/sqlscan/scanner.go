@@ -11,28 +11,6 @@ type scanner struct {
 	pos int
 }
 
-// atTopLevel reports whether the cursor sits outside every quoting and
-// comment construct, i.e. where a semicolon truly ends a statement.
-func (s *scanner) atTopLevel() bool { return !s.inSkippable() }
-
-// inSkippable reports whether the byte at the cursor begins, or lies
-// within, a construct whose contents are not SQL syntax.
-func (s *scanner) inSkippable() bool {
-	return s.skippableLen() > 0
-}
-
-// advance moves the cursor forward: past a whole skippable construct if
-// one starts here, otherwise by a single byte.
-func (s *scanner) advance() {
-	if n := s.skippableLen(); n > 0 {
-		s.pos += n
-
-		return
-	}
-
-	s.pos++
-}
-
 // skippableLen returns the byte length of the skippable construct that
 // starts at the cursor, or 0 if a normal SQL byte is there.
 func (s *scanner) skippableLen() int {

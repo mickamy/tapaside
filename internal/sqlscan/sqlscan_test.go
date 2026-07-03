@@ -57,6 +57,7 @@ func TestReadOnly(t *testing.T) {
 		{name: "alter", sql: "ALTER TABLE t ADD COLUMN c int", want: false},
 		{name: "grant", sql: "GRANT ALL ON t TO alice", want: false},
 		{name: "data-modifying cte", sql: "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", want: false},
+		{name: "cte with select into", sql: "WITH c AS (SELECT 1) SELECT * INTO t FROM c", want: false},
 		{name: "read then write", sql: "SELECT 1; DELETE FROM users", want: false},
 		{name: "write then read", sql: "DELETE FROM users; SELECT 1", want: false},
 		{name: "unknown verb", sql: "FROBNICATE users", want: false},

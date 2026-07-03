@@ -94,7 +94,8 @@ func Split(sql string) []string {
 
 	s := scanner{src: sql}
 	for s.pos < len(s.src) {
-		if s.src[s.pos] == ';' && s.atTopLevel() {
+		n := s.skippableLen()
+		if n == 0 && s.src[s.pos] == ';' {
 			if stmt := strings.TrimSpace(s.src[start:s.pos]); stmt != "" {
 				stmts = append(stmts, stmt)
 			}
@@ -105,7 +106,7 @@ func Split(sql string) []string {
 			continue
 		}
 
-		s.advance()
+		s.pos += max(n, 1)
 	}
 
 	if stmt := strings.TrimSpace(s.src[start:]); stmt != "" {
@@ -131,14 +132,16 @@ func classify(stmt string) Kind {
 		}
 	}
 
+	// SELECT ... INTO creates a table, so it is the one read-shaped write.
+	// It can sit behind a CTE (WITH ... SELECT ... INTO), so this is
+	// checked before the WITH short-circuit below.
+	if (head == "select" || head == "with") && slices.Contains(words, "into") {
+		return Write
+	}
+
 	if head == "with" {
 		// No write verb was found above, so the CTE body only reads.
 		return Read
-	}
-
-	// SELECT ... INTO creates a table, so it is the one SELECT that writes.
-	if head == "select" && slices.Contains(words, "into") {
-		return Write
 	}
 
 	if readKeywords[head] || controlKeywords[head] {
@@ -148,9 +151,10 @@ func classify(stmt string) Kind {
 	return Write
 }
 
-// significantWords returns the lowercased alphabetic words of stmt,
-// skipping string literals, quoted identifiers, and comments so that a
-// keyword hidden in a literal is never mistaken for an operative verb.
+// significantWords returns the lowercased words of stmt, skipping string
+// literals, quoted identifiers, and comments so that a keyword hidden in
+// a literal is never mistaken for an operative verb. Keywords are ASCII,
+// so bytes are lowercased in place rather than allocating with ToLower.
 func significantWords(stmt string) []string {
 	var (
 		words []string
@@ -159,24 +163,27 @@ func significantWords(stmt string) []string {
 
 	flush := func() {
 		if word.Len() > 0 {
-			words = append(words, strings.ToLower(word.String()))
+			words = append(words, word.String())
 			word.Reset()
 		}
 	}
 
 	s := scanner{src: stmt}
 	for s.pos < len(s.src) {
-		if s.inSkippable() {
+		if n := s.skippableLen(); n > 0 {
 			flush()
-			s.advance()
+			s.pos += n
 
 			continue
 		}
 
 		c := s.src[s.pos]
-		if isWordByte(c) {
+		switch {
+		case c >= 'A' && c <= 'Z':
+			word.WriteByte(c + ('a' - 'A'))
+		case isWordByte(c):
 			word.WriteByte(c)
-		} else {
+		default:
 			flush()
 		}
 
