@@ -395,6 +395,106 @@ func TestIsDisconnect(t *testing.T) {
 	}
 }
 
+// scriptedConn is a net.Conn whose Read serves the given chunks one
+// call at a time, then keeps returning finalErr.
+type scriptedConn struct {
+	chunks   [][]byte
+	finalErr error
+	call     int
+}
+
+func (c *scriptedConn) Read(p []byte) (int, error) {
+	if c.call < len(c.chunks) {
+		n := copy(p, c.chunks[c.call])
+		c.call++
+
+		return n, nil
+	}
+
+	return 0, c.finalErr
+}
+
+func (c *scriptedConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *scriptedConn) Close() error                { return nil }
+func (c *scriptedConn) LocalAddr() net.Addr         { return &net.TCPAddr{} }
+func (c *scriptedConn) RemoteAddr() net.Addr        { return &net.TCPAddr{} }
+func (c *scriptedConn) SetDeadline(time.Time) error { return nil }
+func (c *scriptedConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (c *scriptedConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+// A client that dies abruptly right after a complete message must tear
+// the session down immediately — not enter the half-close path and wait
+// for a response on behalf of a peer that no longer exists.
+func TestHandler_AbruptResetTearsDownSession(t *testing.T) {
+	t.Parallel()
+
+	var startup, query bytes.Buffer
+
+	m := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+	if _, err := m.WriteTo(&startup); err != nil {
+		t.Fatalf("encode startup: %v", err)
+	}
+	if _, err := (pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}).WriteTo(&query); err != nil {
+		t.Fatalf("encode query: %v", err)
+	}
+
+	client := &scriptedConn{
+		chunks:   [][]byte{startup.Bytes(), query.Bytes()},
+		finalErr: syscall.ECONNRESET,
+	}
+
+	upstreamL := listen(t)
+
+	// The fake upstream consumes the session but never responds and
+	// never closes: only a full teardown lets ServeConn return.
+	go func() {
+		conn, err := upstreamL.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+		if _, err := pgwire.ReadStartup(conn); err != nil {
+			return
+		}
+		if _, err := pgwire.ReadMessage(conn); err != nil {
+			return
+		}
+
+		buf := make([]byte, 1)
+		_, _ = conn.Read(buf) // blocks until the proxy closes the conn
+	}()
+
+	var d net.Dialer
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		c, err := d.DialContext(ctx, "tcp", upstreamL.Addr().String())
+		if err != nil {
+			return nil, fmt.Errorf("dial: %w", err)
+		}
+
+		return c, nil
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- (pg.Handler{}).ServeConn(t.Context(), client, dial) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("ServeConn() = %v, want nil (reset is a clean disconnect)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeConn did not return; the reset was treated as a half-close")
+	}
+}
+
 // panicAfterConn is a net.Conn whose Read serves data once, then
 // panics, to simulate a bug inside a relay pump.
 type panicAfterConn struct {

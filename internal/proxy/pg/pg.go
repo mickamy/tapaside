@@ -107,9 +107,13 @@ type closeWriter interface {
 }
 
 type pumpResult struct {
-	// fromClient marks the client-to-upstream pump's result.
-	fromClient bool
-	err        error
+	// halfClose is set only by the client-to-upstream pump, when the
+	// client closed its write side cleanly on a message boundary and
+	// may still be waiting for responses. Abrupt disconnects (reset,
+	// mid-message EOF) never set it: that client is gone, so its
+	// session is torn down instead of served out.
+	halfClose bool
+	err       error
 }
 
 // relay pumps bytes in both directions. The client-to-upstream
@@ -117,12 +121,13 @@ type pumpResult struct {
 // inspect queries before they reach the database; the
 // upstream-to-client direction is copied verbatim.
 //
-// When the client finishes cleanly it may have only half-closed to
-// wait for the rest of the response, so the proxy propagates the EOF
-// with CloseWrite and keeps relaying; the backend closes on its own
-// EOF, which bounds the wait. In every other case the first result is
-// the causal one: both connections are closed to unblock the other
-// pump, whose late error is noise.
+// A client that half-closes cleanly on a message boundary may still be
+// waiting for the rest of the response, so the proxy propagates the
+// EOF with CloseWrite and keeps relaying; the backend closes on its own
+// EOF, which bounds the wait. Any other way a session ends — abrupt
+// disconnect included — the first result is the causal one: both
+// connections are closed to unblock the other pump, whose late error
+// is noise.
 func relay(client net.Conn, clientR io.Reader, upstream net.Conn) error {
 	done := make(chan pumpResult, 2)
 
@@ -132,14 +137,12 @@ func relay(client net.Conn, clientR io.Reader, upstream net.Conn) error {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				done <- pumpResult{
-					fromClient: true,
-					err:        fmt.Errorf("pg: relay client to upstream: panic: %v\n%s", r, debug.Stack()),
-				}
+				done <- pumpResult{err: fmt.Errorf("pg: relay client to upstream: panic: %v\n%s", r, debug.Stack())}
 			}
 		}()
 
-		done <- pumpResult{fromClient: true, err: copyMessages(upstream, clientR)}
+		halfClose, err := copyMessages(upstream, clientR)
+		done <- pumpResult{halfClose: halfClose, err: err}
 	}()
 	go func() {
 		defer func() {
@@ -159,7 +162,7 @@ func relay(client net.Conn, clientR io.Reader, upstream net.Conn) error {
 
 	first := <-done
 
-	if first.fromClient && first.err == nil {
+	if first.halfClose {
 		if cw, ok := upstream.(closeWriter); ok && cw.CloseWrite() == nil {
 			second := <-done
 
@@ -177,23 +180,30 @@ func relay(client net.Conn, clientR io.Reader, upstream net.Conn) error {
 	return first.err
 }
 
-func copyMessages(dst io.Writer, src io.Reader) error {
+// copyMessages relays framed messages from src until it disconnects.
+// It reports halfClose only for a clean EOF on a message boundary — the
+// one case where the client deliberately shut down its write side and
+// may still be waiting for responses.
+func copyMessages(dst io.Writer, src io.Reader) (halfClose bool, _ error) {
 	for {
 		m, err := pgwire.ReadMessage(src)
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return true, nil // clean half-close on a message boundary
+			}
 			if isDisconnect(err) {
-				return nil // the peer went away; normal for a proxy
+				return false, nil // the peer went away; normal for a proxy
 			}
 
-			return fmt.Errorf("read client message: %w", err)
+			return false, fmt.Errorf("read client message: %w", err)
 		}
 
 		if _, err := m.WriteTo(dst); err != nil {
 			if isDisconnect(err) {
-				return nil
+				return false, nil
 			}
 
-			return fmt.Errorf("forward client message: %w", err)
+			return false, fmt.Errorf("forward client message: %w", err)
 		}
 	}
 }
