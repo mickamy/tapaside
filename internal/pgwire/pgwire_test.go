@@ -371,6 +371,32 @@ func TestReadyForQuery(t *testing.T) {
 	}
 }
 
+func TestMessage_Bytes(t *testing.T) {
+	t.Parallel()
+
+	m := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+
+	got := m.Bytes()
+
+	// Bytes must equal what WriteTo produces, but in a single slice.
+	var buf bytes.Buffer
+	if _, err := m.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo() error = %v", err)
+	}
+	if !bytes.Equal(got, buf.Bytes()) {
+		t.Errorf("Bytes() = %q, want %q", got, buf.Bytes())
+	}
+
+	// And it must round-trip back through ReadMessage.
+	rt, err := pgwire.ReadMessage(bytes.NewReader(got))
+	if err != nil {
+		t.Fatalf("ReadMessage() error = %v", err)
+	}
+	if rt.Type != m.Type || !bytes.Equal(rt.Payload, m.Payload) {
+		t.Errorf("round trip = %+v, want %+v", rt, m)
+	}
+}
+
 func TestMessage_WriteTo(t *testing.T) {
 	t.Parallel()
 

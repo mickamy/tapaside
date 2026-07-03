@@ -194,6 +194,11 @@ func readPayload(r io.Reader, size int) ([]byte, error) {
 // WriteTo writes the message in wire format. On a net.Conn the header
 // and payload go out in one writev call, without copying the payload
 // into a contiguous buffer.
+//
+// Note that on a plain io.Writer, net.Buffers falls back to one Write
+// per buffer (header, then payload). A caller that shares the writer
+// with another goroutine and needs the message to be indivisible must
+// use Bytes and a single Write instead.
 func (m Message) WriteTo(w io.Writer) (int64, error) {
 	length := 4 + len(m.Payload)
 	if length > maxMessageLength {
@@ -211,4 +216,22 @@ func (m Message) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	return n, nil
+}
+
+// Bytes returns the message in wire format as a single contiguous slice,
+// for callers that must write it in one Write call. It panics if the
+// payload exceeds the protocol limit, which a well-formed message never
+// does.
+func (m Message) Bytes() []byte {
+	length := 4 + len(m.Payload)
+	if length > maxMessageLength {
+		panic(fmt.Sprintf("pgwire: message payload too large: %d bytes", len(m.Payload)))
+	}
+
+	buf := make([]byte, 5+len(m.Payload))
+	buf[0] = m.Type
+	binary.BigEndian.PutUint32(buf[1:5], uint32(length))
+	copy(buf[5:], m.Payload)
+
+	return buf
 }
