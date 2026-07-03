@@ -193,16 +193,38 @@ func relay(client net.Conn, clientR io.Reader, upstream net.Conn, pol policy.Pol
 	return first.err
 }
 
+// Client message types this handler inspects. See the PostgreSQL
+// frontend/backend protocol for the full set.
+const (
+	msgParse        = 'P' // extended protocol: define a statement
+	msgBind         = 'B' // extended protocol: bind a portal
+	msgExecute      = 'E' // extended protocol: run a portal
+	msgDescribe     = 'D' // extended protocol: describe a statement/portal
+	msgClose        = 'C' // extended protocol: close a statement/portal
+	msgSync         = 'S' // extended protocol: end of a message batch
+	msgFunctionCall = 'F' // legacy fast-path function call
+)
+
 // copyMessages relays framed client messages to the upstream until the
-// client disconnects, evaluating each simple query against pol first. A
-// blocked query is not forwarded; the proxy answers it directly on
-// clientW with an ErrorResponse and a ReadyForQuery, exactly as the
-// backend would after refusing a statement.
+// client disconnects, enforcing pol before anything reaches the
+// database. A blocked simple query is answered directly on clientW with
+// an ErrorResponse and a ReadyForQuery, exactly as the backend would
+// after refusing a statement.
+//
+// The lexer can only classify the SQL text of a simple query, so when a
+// policy is active the handler is fail-closed on message types it
+// cannot evaluate: the extended query protocol (Parse/Bind/Execute/...)
+// and fast-path function calls are refused rather than forwarded, so a
+// prepared-statement client cannot slip a write past an active policy.
+// Evaluating the SQL carried in Parse is a later step; until then this
+// trades prepared-statement support for a boundary that does not leak.
 //
 // It reports halfClose only for a clean EOF on a message boundary — the
 // one case where the client deliberately shut down its write side and
 // may still be waiting for responses.
 func copyMessages(upstream, clientW io.Writer, src io.Reader, pol policy.Policy) (halfClose bool, _ error) {
+	f := msgFilter{clientW: clientW, pol: pol, enforce: pol.Enforces()}
+
 	for {
 		m, err := pgwire.ReadMessage(src)
 		if err != nil {
@@ -216,18 +238,16 @@ func copyMessages(upstream, clientW io.Writer, src io.Reader, pol policy.Policy)
 			return false, fmt.Errorf("read client message: %w", err)
 		}
 
-		if m.IsQuery() {
-			if res := pol.Evaluate(m.QueryText()); res.Decision == policy.Blocked {
-				if err := deny(clientW, res); err != nil {
-					if isDisconnect(err) {
-						return false, nil
-					}
-
-					return false, err
-				}
-
-				continue // the query never reaches the database
+		handled, err := f.handle(m)
+		if err != nil {
+			if isDisconnect(err) {
+				return false, nil
 			}
+
+			return false, err
+		}
+		if handled {
+			continue
 		}
 
 		if _, err := m.WriteTo(upstream); err != nil {
@@ -240,21 +260,94 @@ func copyMessages(upstream, clientW io.Writer, src io.Reader, pol policy.Policy)
 	}
 }
 
-// deny answers a blocked query on w the way the backend answers a
+// msgFilter applies policy to each client message, answering blocked or
+// unsupported ones directly on the client and tracking the extended
+// protocol's skip-until-Sync recovery state across messages.
+type msgFilter struct {
+	clientW io.Writer
+	pol     policy.Policy
+	enforce bool
+	// skipUntilSync is set after an extended-protocol batch is refused;
+	// the backend discards a failed batch until Sync, so the proxy does
+	// the same, then answers with one ReadyForQuery.
+	skipUntilSync bool
+}
+
+// handle returns handled=true when the message was answered locally (a
+// blocked query, a refused extended-protocol message, or one swallowed
+// during skip-until-sync) and must not be forwarded upstream.
+func (f *msgFilter) handle(m pgwire.Message) (bool, error) {
+	if f.skipUntilSync {
+		if m.Type == msgSync {
+			f.skipUntilSync = false
+
+			return true, writeReady(f.clientW)
+		}
+
+		return true, nil // discard everything until the batch ends
+	}
+
+	if m.IsQuery() {
+		if res := f.pol.Evaluate(m.QueryText()); res.Decision == policy.Blocked {
+			return true, denyQuery(f.clientW, res)
+		}
+
+		return false, nil
+	}
+
+	if !f.enforce {
+		return false, nil
+	}
+
+	switch m.Type {
+	case msgParse, msgBind, msgExecute, msgDescribe, msgClose:
+		// Refuse the whole batch, then swallow up to its Sync.
+		f.skipUntilSync = true
+
+		return true, writeError(f.clientW, "0A000", extendedNotSupported)
+	case msgFunctionCall:
+		// Fast-path is not followed by Sync; answer it on its own.
+		if err := writeError(f.clientW, "0A000", fastPathNotSupported); err != nil {
+			return true, err
+		}
+
+		return true, writeReady(f.clientW)
+	}
+
+	return false, nil
+}
+
+const (
+	extendedNotSupported = "tapaside: the extended query protocol is not supported while a policy is active; " +
+		"use the simple query protocol"
+	fastPathNotSupported = "tapaside: fast-path function calls are not supported while a policy is active"
+)
+
+// denyQuery answers a blocked simple query the way the backend answers a
 // rejected statement: an ErrorResponse followed by ReadyForQuery so the
 // client leaves its busy state and can send the next query.
-func deny(w io.Writer, res policy.Result) error {
-	msg := fmt.Sprintf("blocked by tapaside policy (%s)", res.Rule)
-
+func denyQuery(w io.Writer, res policy.Result) error {
 	// 42501 is insufficient_privilege, the closest standard SQLSTATE for
 	// "the gateway refused this", and one clients surface as a normal
 	// permission error rather than a connection fault.
-	if _, err := pgwire.ErrorResponse("42501", msg).WriteTo(w); err != nil {
-		return fmt.Errorf("pg: write deny response: %w", err)
+	if err := writeError(w, "42501", fmt.Sprintf("blocked by tapaside policy (%s)", res.Rule)); err != nil {
+		return err
 	}
 
+	return writeReady(w)
+}
+
+func writeError(w io.Writer, code, message string) error {
+	if _, err := pgwire.ErrorResponse(code, message).WriteTo(w); err != nil {
+		return fmt.Errorf("pg: write error response: %w", err)
+	}
+
+	return nil
+}
+
+func writeReady(w io.Writer) error {
 	if _, err := pgwire.ReadyForQuery('I').WriteTo(w); err != nil {
-		return fmt.Errorf("pg: write ready after deny: %w", err)
+		return fmt.Errorf("pg: write ready for query: %w", err)
 	}
 
 	return nil
