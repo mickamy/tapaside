@@ -3,10 +3,46 @@ package cli
 import (
 	"fmt"
 	"io"
+
+	"github.com/mickamy/tapaside/internal/exit"
+	"github.com/mickamy/tapaside/internal/policy"
 )
 
 func runPolicy(args []string, stdout, stderr io.Writer) int {
-	return notImplemented(args, stdout, stderr)
+	if len(args) == 0 {
+		printPolicyUsage(stderr)
+
+		return exit.Usage
+	}
+
+	switch args[0] {
+	case "check":
+		return runPolicyCheck(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "tapaside: unknown policy command %q\n", args[0])
+		fmt.Fprintln(stderr, "Run 'tapaside policy --help' for usage.")
+
+		return exit.Usage
+	}
+}
+
+func runPolicyCheck(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, "tapaside: policy check takes exactly one file")
+		fmt.Fprintln(stderr, "Run 'tapaside policy --help' for usage.")
+
+		return exit.Usage
+	}
+
+	if _, err := policy.Load(args[0]); err != nil {
+		fmt.Fprintf(stderr, "tapaside: %v\n", err)
+
+		return exit.Error
+	}
+
+	fmt.Fprintf(stdout, "%s: ok\n", args[0])
+
+	return exit.OK
 }
 
 func printPolicyUsage(w io.Writer) {
