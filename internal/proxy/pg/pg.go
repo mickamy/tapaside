@@ -100,51 +100,81 @@ func negotiateStartup(client io.Writer, clientR io.Reader) (pgwire.StartupMessag
 	return pgwire.StartupMessage{}, errors.New("pg: too many encryption requests")
 }
 
-// relay pumps bytes in both directions until either side closes. The
-// client-to-upstream direction is read message by message so that a
-// policy hook can inspect queries before they reach the database; the
+// closeWriter is the half-close capability of *net.TCPConn and
+// *tls.Conn: shut down the write side while reads keep working.
+type closeWriter interface {
+	CloseWrite() error
+}
+
+type pumpResult struct {
+	// fromClient marks the client-to-upstream pump's result.
+	fromClient bool
+	err        error
+}
+
+// relay pumps bytes in both directions. The client-to-upstream
+// direction is read message by message so that a policy hook can
+// inspect queries before they reach the database; the
 // upstream-to-client direction is copied verbatim.
+//
+// When the client finishes cleanly it may have only half-closed to
+// wait for the rest of the response, so the proxy propagates the EOF
+// with CloseWrite and keeps relaying; the backend closes on its own
+// EOF, which bounds the wait. In every other case the first result is
+// the causal one: both connections are closed to unblock the other
+// pump, whose late error is noise.
 func relay(client net.Conn, clientR io.Reader, upstream net.Conn) error {
-	done := make(chan error, 2)
+	done := make(chan pumpResult, 2)
 
 	// Each pump sends exactly one result to done, even when it panics;
-	// the two receives below rely on that. A recovered panic is reported
-	// as a session error so it kills this session, not the proxy.
+	// the receives below rely on that. A recovered panic is reported as
+	// a session error so it kills this session, not the proxy.
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				done <- fmt.Errorf("pg: relay client to upstream: panic: %v\n%s", r, debug.Stack())
+				done <- pumpResult{
+					fromClient: true,
+					err:        fmt.Errorf("pg: relay client to upstream: panic: %v\n%s", r, debug.Stack()),
+				}
 			}
 		}()
 
-		done <- copyMessages(upstream, clientR)
+		done <- pumpResult{fromClient: true, err: copyMessages(upstream, clientR)}
 	}()
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				done <- fmt.Errorf("pg: relay upstream to client: panic: %v\n%s", r, debug.Stack())
+				done <- pumpResult{err: fmt.Errorf("pg: relay upstream to client: panic: %v\n%s", r, debug.Stack())}
 			}
 		}()
 
 		if _, err := io.Copy(client, upstream); err != nil && !isDisconnect(err) {
-			done <- fmt.Errorf("pg: copy upstream to client: %w", err)
+			done <- pumpResult{err: fmt.Errorf("pg: copy upstream to client: %w", err)}
 
 			return
 		}
 
-		done <- nil
+		done <- pumpResult{}
 	}()
 
-	err := <-done
+	first := <-done
 
-	// Unblock the other direction, then wait for it so no goroutine
-	// outlives the session. The first result is the causal one; the
-	// error the second goroutine reports after its peer closed is noise.
+	if first.fromClient && first.err == nil {
+		if cw, ok := upstream.(closeWriter); ok && cw.CloseWrite() == nil {
+			second := <-done
+
+			_ = client.Close()
+			_ = upstream.Close()
+
+			return second.err
+		}
+	}
+
 	_ = client.Close()
 	_ = upstream.Close()
 	<-done
 
-	return err
+	return first.err
 }
 
 func copyMessages(dst io.Writer, src io.Reader) error {

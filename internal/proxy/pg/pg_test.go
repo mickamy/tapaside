@@ -271,6 +271,101 @@ func TestHandler_TooManyEncryptionRequests(t *testing.T) {
 	}
 }
 
+func TestHandler_ClientHalfClose(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+
+	resCh := make(chan upstreamResult, 1)
+
+	go func() {
+		conn, err := upstreamL.Accept()
+		if err != nil {
+			resCh <- upstreamResult{err: fmt.Errorf("accept: %w", err)}
+
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+		var res upstreamResult
+
+		res.startup, err = pgwire.ReadStartup(conn)
+		if err != nil {
+			resCh <- upstreamResult{err: fmt.Errorf("read startup: %w", err)}
+
+			return
+		}
+
+		res.query, err = pgwire.ReadMessage(conn)
+		if err != nil {
+			resCh <- upstreamResult{err: fmt.Errorf("read query: %w", err)}
+
+			return
+		}
+
+		// The client half-closed; the proxy must propagate the EOF to us
+		// before we reply, proving the response path is still open.
+		if _, err := pgwire.ReadMessage(conn); !errors.Is(err, io.EOF) {
+			resCh <- upstreamResult{err: fmt.Errorf("read after half-close = %w, want io.EOF", err)}
+
+			return
+		}
+
+		ready := pgwire.Message{Type: 'Z', Payload: []byte("I")}
+		if _, err := ready.WriteTo(conn); err != nil {
+			resCh <- upstreamResult{err: fmt.Errorf("write ready: %w", err)}
+
+			return
+		}
+
+		resCh <- res
+	}()
+
+	client := dialProxy(t, startProxy(t, upstreamL.Addr().String(), pg.Handler{}))
+
+	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+	if _, err := startup.WriteTo(client); err != nil {
+		t.Fatalf("write startup: %v", err)
+	}
+
+	query := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	if _, err := query.WriteTo(client); err != nil {
+		t.Fatalf("write query: %v", err)
+	}
+
+	tcp, ok := client.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("client is %T, want *net.TCPConn", client)
+	}
+	if err := tcp.CloseWrite(); err != nil {
+		t.Fatalf("half-close: %v", err)
+	}
+
+	// The response written after our half-close must still arrive.
+	ready, err := pgwire.ReadMessage(client)
+	if err != nil {
+		t.Fatalf("read ready response: %v", err)
+	}
+	if ready.Type != 'Z' {
+		t.Errorf("ready response type = %c, want Z", ready.Type)
+	}
+
+	res := <-resCh
+	if res.err != nil {
+		t.Fatalf("upstream: %v", res.err)
+	}
+	if res.query.Type != query.Type || !bytes.Equal(res.query.Payload, query.Payload) {
+		t.Errorf("upstream query = %+v, want %+v", res.query, query)
+	}
+
+	buf := make([]byte, 1)
+	if _, err := client.Read(buf); !errors.Is(err, io.EOF) {
+		t.Errorf("read after response = %v, want io.EOF", err)
+	}
+}
+
 func TestIsDisconnect(t *testing.T) {
 	t.Parallel()
 
