@@ -34,10 +34,15 @@ func runPolicyCheck(args []string, stdout, stderr io.Writer) int {
 		return exit.Usage
 	}
 
-	if _, err := policy.Load(args[0]); err != nil {
+	p, err := policy.Load(args[0])
+	if err != nil {
 		fmt.Fprintf(stderr, "tapaside: %v\n", err)
 
 		return exit.Error
+	}
+
+	if !p.Enforces() {
+		fmt.Fprintf(stderr, "tapaside: warning: %s enables no rules; all queries would be allowed\n", args[0])
 	}
 
 	fmt.Fprintf(stdout, "%s: ok\n", args[0])

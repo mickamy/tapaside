@@ -255,6 +255,26 @@ func TestRunPolicyCheck_ValidFile(t *testing.T) {
 	}
 }
 
+func TestRunPolicyCheck_WarnsOnNoRules(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := os.WriteFile(path, []byte("read_only: false\n"), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+
+	code := cli.Run([]string{"policy", "check", path}, &stdout, &stderr)
+
+	if code != exit.OK {
+		t.Errorf("Run() = %d, want %d", code, exit.OK)
+	}
+	if !strings.Contains(stderr.String(), "enables no rules") {
+		t.Errorf("stderr = %q, want a no-rules warning", stderr.String())
+	}
+}
+
 func TestPrintUsage(t *testing.T) {
 	t.Parallel()
 
