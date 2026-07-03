@@ -41,11 +41,25 @@ var readKeywords = map[string]bool{
 	"show":    true,
 	"values":  true,
 	"table":   true,
-	"explain": true,
 	"declare": true,
 	"fetch":   true,
 	"move":    true,
 	"close":   true,
+}
+
+// explainOptions are the words that make up an EXPLAIN prefix — the
+// legacy ANALYZE/VERBOSE form and the parenthesized option list with its
+// values. classify skips them to reach the underlying statement, since
+// EXPLAIN ANALYZE executes it (so EXPLAIN ANALYZE INSERT/CREATE writes).
+// The list need not be exhaustive: an unknown option word is treated as
+// the underlying head, which is not a read keyword and so is refused —
+// over-blocking a valid EXPLAIN, never letting a write through.
+var explainOptions = map[string]bool{
+	"analyze": true, "verbose": true, "costs": true, "settings": true,
+	"generic_plan": true, "buffers": true, "serialize": true, "wal": true,
+	"timing": true, "summary": true, "memory": true, "format": true,
+	"on": true, "off": true, "true": true, "false": true,
+	"text": true, "xml": true, "json": true, "yaml": true, "none": true, "binary": true,
 }
 
 // writeKeywords are keywords that force a Write verdict wherever they
@@ -133,9 +147,22 @@ func Split(sql string) []string {
 func classify(stmt string) Kind {
 	head := ""
 	var headStartsCTEOrSelect bool
+	var sawExplain bool
 
 	for w := range significantWords(stmt) {
 		if head == "" {
+			// EXPLAIN ANALYZE executes the underlying statement, so skip
+			// the EXPLAIN prefix and its options to classify what actually
+			// runs, rather than reading the head as "explain".
+			if !sawExplain && strings.EqualFold(w, "explain") {
+				sawExplain = true
+
+				continue
+			}
+			if sawExplain && explainOptions[strings.ToLower(w)] {
+				continue
+			}
+
 			head = w
 			headStartsCTEOrSelect = strings.EqualFold(w, "select") || strings.EqualFold(w, "with")
 		}

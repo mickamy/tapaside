@@ -35,6 +35,7 @@ func TestReadOnly(t *testing.T) {
 		{name: "keyword in string literal", sql: "SELECT 'delete from users'", want: true},
 		{name: "keyword in quoted identifier", sql: `SELECT "insert" FROM t`, want: true},
 		{name: "explain analyze select", sql: "EXPLAIN ANALYZE SELECT 1", want: true},
+		{name: "explain parenthesized options select", sql: "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1", want: true},
 
 		// Non-data-modifying control statements: allowed under read-only.
 		{name: "begin", sql: "BEGIN", want: true},
@@ -70,6 +71,10 @@ func TestReadOnly(t *testing.T) {
 		{name: "unknown verb", sql: "FROBNICATE users", want: false},
 		{name: "explain analyze then insert", sql: "EXPLAIN SELECT 1; INSERT INTO t VALUES (1)", want: false},
 		{name: "select into", sql: "SELECT * INTO new_table FROM old_table", want: false},
+		{name: "explain analyze insert", sql: "EXPLAIN ANALYZE INSERT INTO t VALUES (1)", want: false},
+		{name: "explain analyze create table as", sql: "EXPLAIN ANALYZE CREATE TABLE t AS SELECT 1", want: false},
+		{name: "explain analyze select into", sql: "EXPLAIN ANALYZE SELECT 1 INTO t", want: false},
+		{name: "explain parenthesized analyze update", sql: "EXPLAIN (ANALYZE) UPDATE t SET x = 1", want: false},
 		{name: "prepare carrying a write", sql: "PREPARE p AS DELETE FROM t", want: false},
 		{name: "call procedure", sql: "CALL do_stuff()", want: false},
 		{name: "do block", sql: "DO $$ BEGIN DELETE FROM t; END $$", want: false},
