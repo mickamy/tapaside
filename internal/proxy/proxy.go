@@ -46,7 +46,10 @@ type Server struct {
 	// closed as soon as they are accepted. Zero means no limit.
 	MaxConns int
 	// DrainTimeout bounds how long Serve waits for in-flight sessions
-	// after shutdown before abandoning them. Zero means wait forever.
+	// after shutdown. When it elapses, session contexts are canceled and
+	// their connections closed to unblock relay I/O, and Serve waits up
+	// to DrainTimeout once more before abandoning what is left. Zero
+	// means wait forever and never force-close.
 	DrainTimeout time.Duration
 }
 
@@ -64,11 +67,19 @@ func (s Server) Serve(ctx context.Context, l net.Listener) error {
 	stop := context.AfterFunc(ctx, func() { _ = l.Close() })
 	defer stop()
 
+	// Sessions are detached from ctx so shutdown does not interrupt
+	// them, but keep a handle to cancel them if draining times out.
+	sessCtx, cancelSessions := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelSessions()
+
 	var (
 		sessions  sync.WaitGroup
 		sem       chan struct{}
 		delay     time.Duration
 		acceptErr error
+
+		mu    sync.Mutex
+		conns = make(map[net.Conn]struct{})
 	)
 
 	if s.MaxConns > 0 {
@@ -121,17 +132,40 @@ func (s Server) Serve(ctx context.Context, l net.Listener) error {
 			}
 		}
 
+		mu.Lock()
+		conns[conn] = struct{}{}
+		mu.Unlock()
+
 		sessions.Go(func() {
+			defer func() {
+				mu.Lock()
+				delete(conns, conn)
+				mu.Unlock()
+			}()
+
 			if sem != nil {
 				defer func() { <-sem }()
 			}
 
-			s.handle(context.WithoutCancel(ctx), conn)
+			s.handle(sessCtx, conn)
 		})
 	}
 
+	if s.drain(&sessions) {
+		return acceptErr
+	}
+
+	s.logf("shutdown: sessions still running after %v; closing their connections\n", s.DrainTimeout)
+	cancelSessions()
+
+	mu.Lock()
+	for conn := range conns {
+		_ = conn.Close()
+	}
+	mu.Unlock()
+
 	if !s.drain(&sessions) {
-		s.logf("shutdown: sessions still running after %v; abandoning them\n", s.DrainTimeout)
+		s.logf("shutdown: sessions still running after forced close; abandoning them\n")
 	}
 
 	return acceptErr

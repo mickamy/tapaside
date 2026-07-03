@@ -407,6 +407,66 @@ func TestServer_DrainTimeout(t *testing.T) {
 	}
 }
 
+func TestServer_DrainForceClosesConnections(t *testing.T) {
+	t.Parallel()
+
+	l := listen(t)
+	ctx, cancel := context.WithCancel(t.Context())
+
+	started := make(chan struct{})
+
+	// The session blocks on conn I/O, not on a channel: only the forced
+	// close of its connection can unblock it.
+	h := handlerFunc(func(_ context.Context, conn net.Conn, _ proxy.Dialer) error {
+		close(started)
+
+		buf := make([]byte, 1)
+		if _, err := conn.Read(buf); err != nil {
+			return fmt.Errorf("read: %w", err)
+		}
+
+		return nil
+	})
+
+	var log syncBuffer
+
+	srv := proxy.Server{
+		Upstream:     "127.0.0.1:1",
+		Handler:      h,
+		Log:          &log,
+		DrainTimeout: 50 * time.Millisecond,
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, l) }()
+
+	dialProxy(t, l.Addr().String())
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not start")
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Serve() = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve() did not return; the forced close did not unblock the session")
+	}
+
+	if !strings.Contains(log.String(), "closing their connections") {
+		t.Errorf("log = %q, want a forced close notice", log.String())
+	}
+	if strings.Contains(log.String(), "abandoning") {
+		t.Errorf("log = %q, want no abandonment after the forced close worked", log.String())
+	}
+}
+
 func TestServer_MaxConns(t *testing.T) {
 	t.Parallel()
 
