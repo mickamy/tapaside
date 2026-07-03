@@ -267,6 +267,104 @@ func TestHandler_ReadOnlyBlocksWrite(t *testing.T) {
 	}
 }
 
+func TestHandler_DenyReportsTransactionStatus(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+
+	upErr := make(chan error, 1)
+
+	// The fake backend accepts BEGIN and reports it is in a transaction
+	// ('T'); the blocked UPDATE that follows never reaches it.
+	go func() {
+		conn, err := upstreamL.Accept()
+		if err != nil {
+			upErr <- fmt.Errorf("accept: %w", err)
+
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+		if _, err := pgwire.ReadStartup(conn); err != nil {
+			upErr <- fmt.Errorf("read startup: %w", err)
+
+			return
+		}
+
+		if _, err := pgwire.ReadMessage(conn); err != nil { // BEGIN
+			upErr <- fmt.Errorf("read begin: %w", err)
+
+			return
+		}
+
+		// Report the transaction is now open.
+		if _, err := pgwire.ReadyForQuery('T').WriteTo(conn); err != nil {
+			upErr <- fmt.Errorf("write ready(T): %w", err)
+
+			return
+		}
+
+		upErr <- nil
+
+		// Keep the connection open so the proxy's response pump does not
+		// hit EOF and tear down the session while the test exercises the
+		// deny path; unblocks when the proxy closes the conn at cleanup.
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := dialProxy(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+	if _, err := startup.WriteTo(client); err != nil {
+		t.Fatalf("write startup: %v", err)
+	}
+
+	// BEGIN is allowed and forwarded; read the backend's ReadyForQuery('T').
+	begin := pgwire.Message{Type: 'Q', Payload: []byte("BEGIN\x00")}
+	if _, err := begin.WriteTo(client); err != nil {
+		t.Fatalf("write begin: %v", err)
+	}
+
+	ready, err := pgwire.ReadMessage(client)
+	if err != nil {
+		t.Fatalf("read ready after begin: %v", err)
+	}
+	if ready.Type != 'Z' || len(ready.Payload) != 1 || ready.Payload[0] != 'T' {
+		t.Fatalf("ready after begin = %+v, want Z with status T", ready)
+	}
+
+	// A write inside the transaction is blocked; the synthesized
+	// ReadyForQuery must report the failed-transaction state 'E', not 'I',
+	// so the client knows to roll back rather than believe it is idle.
+	write := pgwire.Message{Type: 'Q', Payload: []byte("UPDATE t SET x = 1\x00")}
+	if _, err := write.WriteTo(client); err != nil {
+		t.Fatalf("write blocked update: %v", err)
+	}
+
+	errResp, err := pgwire.ReadMessage(client)
+	if err != nil {
+		t.Fatalf("read error response: %v", err)
+	}
+	if errResp.Type != 'E' {
+		t.Fatalf("response type = %c, want E", errResp.Type)
+	}
+
+	denyReady, err := pgwire.ReadMessage(client)
+	if err != nil {
+		t.Fatalf("read ready after deny: %v", err)
+	}
+	if denyReady.Type != 'Z' || len(denyReady.Payload) != 1 || denyReady.Payload[0] != 'E' {
+		t.Errorf("ready after deny = %+v, want Z with status E (in-transaction deny)", denyReady)
+	}
+
+	if err := <-upErr; err != nil {
+		t.Fatalf("upstream: %v", err)
+	}
+}
+
 func TestHandler_ReadOnlyRefusesExtendedProtocol(t *testing.T) {
 	t.Parallel()
 

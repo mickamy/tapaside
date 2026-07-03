@@ -6,18 +6,27 @@ package pg
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/mickamy/tapaside/internal/pgwire"
 	"github.com/mickamy/tapaside/internal/policy"
 	"github.com/mickamy/tapaside/internal/proxy"
+)
+
+// Transaction status bytes carried by ReadyForQuery.
+const (
+	txIdle   = 'I' // not in a transaction
+	txActive = 'T' // in a transaction block
+	txFailed = 'E' // in a failed transaction block
 )
 
 // maxStartupReads bounds how many startup-phase messages a client may
@@ -146,6 +155,12 @@ func relay(client net.Conn, clientR io.Reader, upstream net.Conn, pol policy.Pol
 	// queries. Serialize them so the two never interleave a write.
 	clientW := &syncWriter{w: client}
 
+	// The upstream→client pump records each ReadyForQuery status here so
+	// the client→upstream pump can report the real transaction state when
+	// it synthesizes a response for a blocked query.
+	var txStatus atomic.Int32
+	txStatus.Store(int32(txIdle))
+
 	// Each pump sends exactly one result to done, even when it panics;
 	// the receives below rely on that. A recovered panic is reported as
 	// a session error so it kills this session, not the proxy.
@@ -156,7 +171,7 @@ func relay(client net.Conn, clientR io.Reader, upstream net.Conn, pol policy.Pol
 			}
 		}()
 
-		halfClose, err := copyMessages(upstream, clientW, clientR, pol)
+		halfClose, err := copyMessages(upstream, clientW, clientR, pol, &txStatus)
 		done <- pumpResult{halfClose: halfClose, err: err}
 	}()
 	go func() {
@@ -166,7 +181,7 @@ func relay(client net.Conn, clientR io.Reader, upstream net.Conn, pol policy.Pol
 			}
 		}()
 
-		if _, err := io.Copy(clientW, upstream); err != nil && !isDisconnect(err) {
+		if err := copyResponses(clientW, upstream, &txStatus); err != nil && !isDisconnect(err) {
 			done <- pumpResult{err: fmt.Errorf("pg: copy upstream to client: %w", err)}
 
 			return
@@ -224,8 +239,14 @@ const (
 // It reports halfClose only for a clean EOF on a message boundary — the
 // one case where the client deliberately shut down its write side and
 // may still be waiting for responses.
-func copyMessages(upstream io.Writer, clientW *syncWriter, src io.Reader, pol policy.Policy) (halfClose bool, _ error) {
-	f := msgFilter{clientW: clientW, pol: pol, enforce: pol.Enforces()}
+func copyMessages(
+	upstream io.Writer,
+	clientW *syncWriter,
+	src io.Reader,
+	pol policy.Policy,
+	txStatus *atomic.Int32,
+) (halfClose bool, _ error) {
+	f := msgFilter{clientW: clientW, pol: pol, enforce: pol.Enforces(), txStatus: txStatus}
 
 	for {
 		m, err := pgwire.ReadMessage(src)
@@ -269,10 +290,26 @@ type msgFilter struct {
 	clientW *syncWriter
 	pol     policy.Policy
 	enforce bool
+	// txStatus is the last transaction status the backend reported, so a
+	// synthesized ReadyForQuery can tell the client the truth.
+	txStatus *atomic.Int32
 	// skipUntilSync is set after an extended-protocol batch is refused;
 	// the backend discards a failed batch until Sync, so the proxy does
 	// the same, then answers with one ReadyForQuery.
 	skipUntilSync bool
+}
+
+// readyStatus is the transaction status to report when synthesizing a
+// ReadyForQuery for a query the proxy refused. Refusing a statement is
+// an error, and in PostgreSQL an error inside a transaction aborts it,
+// so anything other than idle becomes failed ('E'). The client then
+// rolls back, which the proxy forwards, resyncing both ends.
+func (f *msgFilter) readyStatus() byte {
+	if f.txStatus.Load() == int32(txIdle) {
+		return txIdle
+	}
+
+	return txFailed
 }
 
 // handle returns handled=true when the message was answered locally (a
@@ -283,7 +320,7 @@ func (f *msgFilter) handle(m pgwire.Message) (bool, error) {
 		if m.Type == msgSync {
 			f.skipUntilSync = false
 
-			return true, f.clientW.writeMessage(pgwire.ReadyForQuery('I'))
+			return true, f.clientW.writeMessage(pgwire.ReadyForQuery(f.readyStatus()))
 		}
 
 		return true, nil // discard everything until the batch ends
@@ -311,7 +348,7 @@ func (f *msgFilter) handle(m pgwire.Message) (bool, error) {
 		// Fast-path is not followed by Sync; answer it on its own.
 		return true, f.clientW.writeMessages(
 			pgwire.ErrorResponse("0A000", fastPathNotSupported),
-			pgwire.ReadyForQuery('I'),
+			pgwire.ReadyForQuery(f.readyStatus()),
 		)
 	}
 
@@ -334,7 +371,56 @@ func (f *msgFilter) denyQuery(res policy.Result) error {
 	// and ReadyForQuery go out together so nothing can split the pair.
 	msg := fmt.Sprintf("blocked by tapaside policy (%s)", res.Rule)
 
-	return f.clientW.writeMessages(pgwire.ErrorResponse("42501", msg), pgwire.ReadyForQuery('I'))
+	return f.clientW.writeMessages(pgwire.ErrorResponse("42501", msg), pgwire.ReadyForQuery(f.readyStatus()))
+}
+
+// copyResponses relays backend messages to the client, forwarding each
+// verbatim while recording the transaction status from every
+// ReadyForQuery so the client→upstream pump can report it on a blocked
+// query. Message payloads are streamed rather than buffered, so a large
+// result set does not grow memory; only the tiny ReadyForQuery is read
+// whole to capture its status byte.
+func copyResponses(clientW *syncWriter, upstream io.Reader, txStatus *atomic.Int32) error {
+	var header [5]byte
+
+	for {
+		if _, err := io.ReadFull(upstream, header[:]); err != nil {
+			return fmt.Errorf("read backend message header: %w", err)
+		}
+
+		length := binary.BigEndian.Uint32(header[1:5])
+		if length < 4 {
+			return fmt.Errorf("pg: invalid backend message length %d", length)
+		}
+
+		payloadLen := int64(length) - 4
+
+		// ReadyForQuery is 'Z' + int32(5) + one status byte. Capture the
+		// status and forward the whole 6-byte message in one write.
+		if header[0] == 'Z' && payloadLen == 1 {
+			var status [1]byte
+			if _, err := io.ReadFull(upstream, status[:]); err != nil {
+				return fmt.Errorf("read ready-for-query status: %w", err)
+			}
+
+			txStatus.Store(int32(status[0]))
+
+			if _, err := clientW.Write([]byte{header[0], header[1], header[2], header[3], header[4], status[0]}); err != nil {
+				return fmt.Errorf("forward ready-for-query: %w", err)
+			}
+
+			continue
+		}
+
+		if _, err := clientW.Write(header[:]); err != nil {
+			return fmt.Errorf("forward backend header: %w", err)
+		}
+		if payloadLen > 0 {
+			if _, err := io.CopyN(clientW, upstream, payloadLen); err != nil {
+				return fmt.Errorf("forward backend payload: %w", err)
+			}
+		}
+	}
 }
 
 // syncWriter serializes concurrent writes to the client connection.
