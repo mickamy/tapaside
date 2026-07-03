@@ -61,6 +61,14 @@ func Load(path string) (Policy, error) {
 	return p, nil
 }
 
+// Enforces reports whether the policy would block anything. When it
+// does not, the proxy relays a session untouched; when it does, the
+// proxy must also refuse messages it cannot evaluate (fail-closed)
+// rather than let them bypass an active rule.
+func (p Policy) Enforces() bool {
+	return p.ReadOnly
+}
+
 // Evaluate decides whether the given SQL may proceed.
 func (p Policy) Evaluate(sql string) Result {
 	if p.ReadOnly && !sqlscan.ReadOnly(sql) {
