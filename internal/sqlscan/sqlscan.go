@@ -40,13 +40,10 @@ var readKeywords = map[string]bool{
 }
 
 // writeKeywords are keywords that force a Write verdict wherever they
-// appear as a statement's operative verb, including inside a CTE.
-var writeKeywords = map[string]bool{
-	"insert": true,
-	"update": true,
-	"delete": true,
-	"merge":  true,
-}
+// appear as a statement's operative verb, including inside a CTE. They
+// are compared case-insensitively against raw substrings, so classify
+// never allocates a lowercased copy of every word.
+var writeKeywords = []string{"insert", "update", "delete", "merge"}
 
 // controlKeywords are statement heads that do not modify data:
 // transaction control and session configuration. A read-only policy
@@ -120,55 +117,76 @@ func Split(sql string) []string {
 // It short-circuits: a data-modifying verb (or SELECT ... INTO) returns
 // Write the moment it is seen, so a multi-megabyte bulk INSERT is
 // classified from its first word without scanning the payload.
+//
+// Words arrive as substrings of stmt (no allocation), compared to
+// keywords with case-insensitive EqualFold; only the head is lowercased,
+// once, for the map lookups.
 func classify(stmt string) Kind {
 	head := ""
+	var headStartsCTEOrSelect bool
 
 	for w := range significantWords(stmt) {
 		if head == "" {
 			head = w
+			headStartsCTEOrSelect = strings.EqualFold(w, "select") || strings.EqualFold(w, "with")
 		}
 
 		// A data-modifying verb anywhere (e.g., inside a CTE) means write.
-		if writeKeywords[w] {
+		if isWriteKeyword(w) {
 			return Write
 		}
 
 		// SELECT ... INTO creates a table — the one read-shaped write. It
-		// can sit behind a CTE (WITH ... SELECT ... INTO), so accept a WITH
-		// head too. INSERT ... INTO is already caught by writeKeywords.
-		if (head == "select" || head == "with") && w == "into" {
+		// can sit behind a CTE (WITH ... SELECT ... INTO). INSERT ... INTO
+		// is already caught by isWriteKeyword.
+		if headStartsCTEOrSelect && strings.EqualFold(w, "into") {
 			return Write
 		}
 	}
 
+	if head == "" {
+		return Read // only whitespace, comments, or empty statements
+	}
+
+	h := strings.ToLower(head)
+
 	switch {
-	case head == "": // only whitespace, comments, or empty statements
+	case h == "with": // no write verb was found, so the CTE only reads
 		return Read
-	case head == "with": // no write verb was found, so the CTE only reads
-		return Read
-	case readKeywords[head] || controlKeywords[head]:
+	case readKeywords[h] || controlKeywords[h]:
 		return Read
 	default:
 		return Write
 	}
 }
 
-// significantWords yields the lowercased words of stmt, skipping string
-// literals, quoted identifiers, and comments so that a keyword hidden in
-// a literal is never mistaken for an operative verb. Keywords are ASCII,
-// so bytes are lowercased in place rather than allocating with ToLower.
-// It is a sequence so callers can stop early once they have decided.
+func isWriteKeyword(w string) bool {
+	for _, kw := range writeKeywords {
+		if strings.EqualFold(w, kw) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// significantWords yields each word of stmt as a substring (no copy),
+// skipping string literals, quoted identifiers, and comments so that a
+// keyword hidden in a literal is never mistaken for an operative verb.
+// Substrings avoid a per-word allocation on large statements; callers
+// compare them case-insensitively. It is a sequence so callers can stop
+// early once they have decided.
 func significantWords(stmt string) iter.Seq[string] {
 	return func(yield func(string) bool) {
-		var word strings.Builder
+		start := -1
 
-		flush := func() bool {
-			if word.Len() == 0 {
+		emit := func(end int) bool {
+			if start < 0 {
 				return true
 			}
 
-			w := word.String()
-			word.Reset()
+			w := stmt[start:end]
+			start = -1
 
 			return yield(w)
 		}
@@ -176,7 +194,7 @@ func significantWords(stmt string) iter.Seq[string] {
 		s := scanner{src: stmt}
 		for s.pos < len(s.src) {
 			if n := s.skippableLen(); n > 0 {
-				if !flush() {
+				if !emit(s.pos) {
 					return
 				}
 				s.pos += n
@@ -184,22 +202,18 @@ func significantWords(stmt string) iter.Seq[string] {
 				continue
 			}
 
-			c := s.src[s.pos]
-			switch {
-			case c >= 'A' && c <= 'Z':
-				word.WriteByte(c + ('a' - 'A'))
-			case isWordByte(c):
-				word.WriteByte(c)
-			default:
-				if !flush() {
-					return
+			if isWordByte(s.src[s.pos]) {
+				if start < 0 {
+					start = s.pos
 				}
+			} else if !emit(s.pos) {
+				return
 			}
 
 			s.pos++
 		}
 
-		flush()
+		emit(len(s.src))
 	}
 }
 
