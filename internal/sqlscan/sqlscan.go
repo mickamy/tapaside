@@ -48,7 +48,30 @@ var writeKeywords = map[string]bool{
 	"merge":  true,
 }
 
-// ReadOnly reports whether every statement in sql is a read. An empty
+// controlKeywords are statement heads that do not modify data:
+// transaction control and session configuration. A read-only policy
+// permits them, matching PostgreSQL's own read-only transactions, which
+// allow SET and BEGIN/COMMIT but reject data changes. Without this,
+// real drivers break, since they send SET on connect and wrap reads in
+// transactions. PREPARE and EXECUTE are intentionally absent: a
+// prepared statement can carry a write.
+var controlKeywords = map[string]bool{
+	"begin":     true, // BEGIN
+	"start":     true, // START TRANSACTION
+	"commit":    true, // COMMIT
+	"end":       true, // END = COMMIT
+	"rollback":  true, // ROLLBACK
+	"abort":     true, // ABORT = ROLLBACK
+	"savepoint": true, // SAVEPOINT
+	"release":   true, // RELEASE SAVEPOINT
+	"set":       true, // SET / SET TRANSACTION / SET ROLE
+	"reset":     true, // RESET
+	"discard":   true, // DISCARD
+}
+
+// ReadOnly reports whether every statement in sql is safe under a
+// read-only policy, i.e. none modifies data. Reads and non-modifying
+// control statements (transaction control, SET) qualify; an empty
 // input (only whitespace, comments, or empty statements) is read-only.
 func ReadOnly(sql string) bool {
 	for _, stmt := range Split(sql) {
@@ -118,7 +141,7 @@ func classify(stmt string) Kind {
 		return Write
 	}
 
-	if readKeywords[head] {
+	if readKeywords[head] || controlKeywords[head] {
 		return Read
 	}
 

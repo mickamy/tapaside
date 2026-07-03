@@ -35,6 +35,17 @@ func TestReadOnly(t *testing.T) {
 		{name: "keyword in quoted identifier", sql: `SELECT "insert" FROM t`, want: true},
 		{name: "explain analyze select", sql: "EXPLAIN ANALYZE SELECT 1", want: true},
 
+		// Non-data-modifying control statements: allowed under read-only.
+		{name: "begin", sql: "BEGIN", want: true},
+		{name: "start transaction", sql: "START TRANSACTION", want: true},
+		{name: "commit", sql: "COMMIT", want: true},
+		{name: "rollback", sql: "ROLLBACK", want: true},
+		{name: "savepoint", sql: "SAVEPOINT sp1", want: true},
+		{name: "set", sql: "SET search_path TO public", want: true},
+		{name: "reset", sql: "RESET statement_timeout", want: true},
+		{name: "discard all", sql: "DISCARD ALL", want: true},
+		{name: "transaction wrapping reads", sql: "BEGIN; SELECT 1; COMMIT", want: true},
+
 		// Writes.
 		{name: "insert", sql: "INSERT INTO users VALUES (1)", want: false},
 		{name: "update", sql: "UPDATE users SET x = 1", want: false},
@@ -51,6 +62,10 @@ func TestReadOnly(t *testing.T) {
 		{name: "unknown verb", sql: "FROBNICATE users", want: false},
 		{name: "explain analyze then insert", sql: "EXPLAIN SELECT 1; INSERT INTO t VALUES (1)", want: false},
 		{name: "select into", sql: "SELECT * INTO new_table FROM old_table", want: false},
+		{name: "prepare carrying a write", sql: "PREPARE p AS DELETE FROM t", want: false},
+		{name: "call procedure", sql: "CALL do_stuff()", want: false},
+		{name: "do block", sql: "DO $$ BEGIN DELETE FROM t; END $$", want: false},
+		{name: "transaction wrapping a write", sql: "BEGIN; DELETE FROM t; COMMIT", want: false},
 
 		// Injection-flavored: the write must not hide behind a comment or literal.
 		{name: "write after inline comment", sql: "SELECT 1 /* x */; DELETE FROM t", want: false},
