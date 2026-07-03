@@ -94,9 +94,11 @@ func (s Server) Serve(ctx context.Context, l net.Listener) error {
 			}
 
 			// The runtime already retries EINTR and ECONNABORTED inside
-			// Accept, and no deadline is set on the listener, so the only
-			// transient failure that reaches us is fd exhaustion.
-			if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) {
+			// Accept, and no deadline is set on the listener; what still
+			// reaches us as transient is resource exhaustion (descriptors,
+			// kernel buffers, memory).
+			if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) ||
+				errors.Is(err, syscall.ENOBUFS) || errors.Is(err, syscall.ENOMEM) {
 				if delay == 0 {
 					delay = 5 * time.Millisecond
 				} else {
