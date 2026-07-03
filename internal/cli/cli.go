@@ -17,7 +17,7 @@ type subcommand struct {
 var subcommands = []subcommand{
 	{
 		name:    "proxy",
-		summary: "Run the sidecar proxy that enforces policy before queries reach the database",
+		summary: "Run the sidecar proxy that relays client sessions to the upstream database",
 		run:     runProxy,
 		usage:   printProxyUsage,
 	},
@@ -72,7 +72,7 @@ func lookup(name string) (subcommand, bool) {
 
 func wantsHelp(args []string) bool {
 	for _, a := range args {
-		if a == "--help" || a == "-h" {
+		if a == "--help" || a == "-help" || a == "-h" {
 			return true
 		}
 	}
@@ -81,7 +81,7 @@ func wantsHelp(args []string) bool {
 }
 
 func PrintUsage(w io.Writer) {
-	fmt.Fprintln(w, "tapaside — policy-enforcing sidecar proxy. Decide what's allowed before it hits the database.")
+	fmt.Fprintln(w, "tapaside — transparent PostgreSQL sidecar proxy. Policy enforcement and audit are in development.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "USAGE:")
 	fmt.Fprintln(w, "  tapaside <command> [flags]")
@@ -100,8 +100,8 @@ func PrintUsage(w io.Writer) {
 
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "EXAMPLES:")
-	fmt.Fprintln(w, "  # Run a sidecar in front of PostgreSQL, enforcing policy.yaml")
-	fmt.Fprintln(w, "  tapaside proxy --listen 127.0.0.1:5433 --upstream db.internal:5432 --policy policy.yaml")
+	fmt.Fprintln(w, "  # Run a sidecar in front of PostgreSQL")
+	fmt.Fprintln(w, "  tapaside proxy --listen 127.0.0.1:5433 --upstream db.internal:5432")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  # Validate a policy file before deploying it")
 	fmt.Fprintln(w, "  tapaside policy check policy.yaml")
