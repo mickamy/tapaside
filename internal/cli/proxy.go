@@ -70,6 +70,13 @@ func runProxy(args []string, stdout, stderr io.Writer) int {
 			return exit.Error
 		}
 
+		// A policy file that enables no rules would silently allow every
+		// query — most likely a typo or a truncated file, so say so
+		// rather than start a proxy that enforces nothing.
+		if !p.Enforces() {
+			fmt.Fprintf(stderr, "tapaside: warning: %s enables no rules; all queries will be allowed\n", *policyPath)
+		}
+
 		pol = p
 	}
 
