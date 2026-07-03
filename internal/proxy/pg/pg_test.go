@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -266,6 +268,35 @@ func TestHandler_TooManyEncryptionRequests(t *testing.T) {
 	buf := make([]byte, 1)
 	if _, err := client.Read(buf); !errors.Is(err, io.EOF) {
 		t.Errorf("read after limit = %v, want io.EOF", err)
+	}
+}
+
+func TestIsDisconnect(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "eof", err: io.EOF, want: true},
+		{name: "unexpected eof", err: io.ErrUnexpectedEOF, want: true},
+		{name: "closed conn", err: net.ErrClosed, want: true},
+		{name: "connection reset", err: syscall.ECONNRESET, want: true},
+		{name: "broken pipe", err: syscall.EPIPE, want: true},
+		{name: "wrapped reset", err: fmt.Errorf("read: %w", syscall.ECONNRESET), want: true},
+		{name: "deadline exceeded", err: os.ErrDeadlineExceeded, want: false},
+		{name: "arbitrary error", err: errors.New("boom"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := pg.IsDisconnect(tt.err); got != tt.want {
+				t.Errorf("IsDisconnect(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 

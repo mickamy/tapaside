@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"runtime/debug"
+	"syscall"
 	"time"
 
 	"github.com/mickamy/tapaside/internal/pgwire"
@@ -125,7 +126,7 @@ func relay(client net.Conn, clientR io.Reader, upstream net.Conn) error {
 			}
 		}()
 
-		if _, err := io.Copy(client, upstream); err != nil {
+		if _, err := io.Copy(client, upstream); err != nil && !isDisconnect(err) {
 			done <- fmt.Errorf("pg: copy upstream to client: %w", err)
 
 			return
@@ -150,15 +151,32 @@ func copyMessages(dst io.Writer, src io.Reader) error {
 	for {
 		m, err := pgwire.ReadMessage(src)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil // client closed between messages
+			if isDisconnect(err) {
+				return nil // the peer went away; normal for a proxy
 			}
 
 			return fmt.Errorf("read client message: %w", err)
 		}
 
 		if _, err := m.WriteTo(dst); err != nil {
+			if isDisconnect(err) {
+				return nil
+			}
+
 			return fmt.Errorf("forward client message: %w", err)
 		}
 	}
+}
+
+// isDisconnect reports whether err is one of the errors a vanished or
+// half-closed peer produces. During relay the proxy treats those as
+// normal session termination, not failures worth logging: clients
+// disconnect abruptly all the time (Ctrl+C, crashed apps, mid-message
+// kills), and which relay direction observes it first is a race.
+func isDisconnect(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE)
 }
