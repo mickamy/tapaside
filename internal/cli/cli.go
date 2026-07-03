@@ -17,7 +17,7 @@ type subcommand struct {
 var subcommands = []subcommand{
 	{
 		name:    "proxy",
-		summary: "Run the sidecar proxy that enforces policy before queries reach the database",
+		summary: "Run the sidecar proxy that relays client sessions to the upstream database",
 		run:     runProxy,
 		usage:   printProxyUsage,
 	},
@@ -81,7 +81,7 @@ func wantsHelp(args []string) bool {
 }
 
 func PrintUsage(w io.Writer) {
-	fmt.Fprintln(w, "tapaside — policy-enforcing sidecar proxy. Decide what's allowed before it hits the database.")
+	fmt.Fprintln(w, "tapaside — transparent PostgreSQL sidecar proxy. Policy enforcement and audit are in development.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "USAGE:")
 	fmt.Fprintln(w, "  tapaside <command> [flags]")
