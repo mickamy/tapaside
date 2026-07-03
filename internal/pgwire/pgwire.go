@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"slices"
 )
 
 // Special request codes sent in place of a protocol version during the
@@ -117,17 +116,25 @@ func ReadMessage(r io.Reader) (Message, error) {
 
 // readPayload reads size bytes from r, growing the buffer as bytes
 // arrive instead of trusting size up front, so a peer cannot force a
-// large allocation with a small header alone. A stream that ends
-// mid-payload reports io.ErrUnexpectedEOF, even at a chunk boundary.
+// large allocation with a small header alone. The buffer doubles on
+// each growth (append-style ~1.25x growth for large slices would copy
+// ~4.5x the payload in total; doubling keeps it at ~1x). A stream that
+// ends mid-payload reports io.ErrUnexpectedEOF, even at a chunk
+// boundary.
 func readPayload(r io.Reader, size int) ([]byte, error) {
 	const chunk = 64 << 10
 
 	payload := make([]byte, 0, min(size, chunk))
 
 	for len(payload) < size {
-		n := min(size-len(payload), chunk)
+		if len(payload) == cap(payload) {
+			grown := make([]byte, len(payload), min(2*cap(payload), size))
+			copy(grown, payload)
+			payload = grown
+		}
+
 		start := len(payload)
-		payload = slices.Grow(payload, n)[:start+n]
+		payload = payload[:cap(payload)]
 
 		if _, err := io.ReadFull(r, payload[start:]); err != nil {
 			if errors.Is(err, io.EOF) {
