@@ -36,6 +36,11 @@ const maxStartupReads = 3
 
 const defaultStartupTimeout = 10 * time.Second
 
+// maxMessageLen bounds a backend message payload, mirroring PostgreSQL's
+// 1 GB message limit, so a corrupted length header cannot make the proxy
+// stream an unbounded amount from the upstream.
+const maxMessageLen = 1 << 30
+
 // Handler drives one PostgreSQL client connection, evaluating each
 // query against Policy before it reaches the database.
 type Handler struct {
@@ -389,7 +394,7 @@ func copyResponses(clientW *syncWriter, upstream io.Reader, txStatus *atomic.Int
 		}
 
 		length := binary.BigEndian.Uint32(header[1:5])
-		if length < 4 {
+		if length < 4 || length > maxMessageLen {
 			return fmt.Errorf("pg: invalid backend message length %d", length)
 		}
 
@@ -422,6 +427,10 @@ func copyResponses(clientW *syncWriter, upstream io.Reader, txStatus *atomic.Int
 				return fmt.Errorf("forward backend header: %w", err)
 			}
 			if payloadLen > 0 {
+				// io.CopyN lets the client conn's ReadFrom take over, which
+				// is splice (zero-copy) between two TCP sockets on Linux —
+				// no per-message buffer. io.CopyBuffer would not change this:
+				// ReaderFrom takes precedence and the buffer is ignored.
 				if _, err := io.CopyN(w, upstream, payloadLen); err != nil {
 					return fmt.Errorf("forward backend payload: %w", err)
 				}
