@@ -90,6 +90,12 @@ func TestRun(t *testing.T) {
 			wantStderr: "invalid --upstream",
 		},
 		{
+			name:       "proxy reports missing policy file",
+			args:       []string{"proxy", "--upstream", "127.0.0.1:5432", "--policy", "/nonexistent/policy.yaml"},
+			wantCode:   exit.Error,
+			wantStderr: "policy:",
+		},
+		{
 			name:       "proxy rejects invalid startup timeout",
 			args:       []string{"proxy", "--upstream", "127.0.0.1:5432", "--startup-timeout", "abc"},
 			wantCode:   exit.Usage,
