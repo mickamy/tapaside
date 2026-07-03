@@ -2,10 +2,12 @@ package pg_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -251,6 +253,67 @@ func TestHandler_TooManyEncryptionRequests(t *testing.T) {
 	buf := make([]byte, 1)
 	if _, err := client.Read(buf); !errors.Is(err, io.EOF) {
 		t.Errorf("read after limit = %v, want io.EOF", err)
+	}
+}
+
+// panicAfterConn is a net.Conn whose Read serves data once, then
+// panics, to simulate a bug inside a relay pump.
+type panicAfterConn struct {
+	data  []byte
+	calls int
+}
+
+func (c *panicAfterConn) Read(p []byte) (int, error) {
+	c.calls++
+	if c.calls == 1 {
+		return copy(p, c.data), nil
+	}
+
+	panic("read exploded")
+}
+
+func (c *panicAfterConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *panicAfterConn) Close() error                { return nil }
+func (c *panicAfterConn) LocalAddr() net.Addr         { return &net.TCPAddr{} }
+func (c *panicAfterConn) RemoteAddr() net.Addr        { return &net.TCPAddr{} }
+func (c *panicAfterConn) SetDeadline(time.Time) error { return nil }
+func (c *panicAfterConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (c *panicAfterConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func TestHandler_RelayPumpPanicIsContained(t *testing.T) {
+	t.Parallel()
+
+	var startup bytes.Buffer
+
+	m := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+	if _, err := m.WriteTo(&startup); err != nil {
+		t.Fatalf("encode startup: %v", err)
+	}
+
+	client := &panicAfterConn{data: startup.Bytes()}
+
+	up, peer := net.Pipe()
+	t.Cleanup(func() { _ = up.Close(); _ = peer.Close() })
+
+	// Consume whatever the proxy forwards so pipe writes do not block.
+	go func() { _, _ = io.Copy(io.Discard, peer) }()
+
+	dial := func(context.Context) (net.Conn, error) { return up, nil }
+
+	done := make(chan error, 1)
+	go func() { done <- (pg.Handler{}).ServeConn(t.Context(), client, dial) }()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "panic") {
+			t.Errorf("ServeConn() = %v, want an error mentioning the panic", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeConn did not return; a relay pump leaked")
 	}
 }
 

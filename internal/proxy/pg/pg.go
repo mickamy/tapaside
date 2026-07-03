@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime/debug"
 
 	"github.com/mickamy/tapaside/internal/pgwire"
 	"github.com/mickamy/tapaside/internal/proxy"
@@ -82,10 +83,25 @@ func negotiateStartup(client io.Writer, clientR io.Reader) (pgwire.StartupMessag
 func relay(client net.Conn, clientR io.Reader, upstream net.Conn) error {
 	done := make(chan error, 2)
 
+	// Each pump sends exactly one result to done, even when it panics;
+	// the two receives below rely on that. A recovered panic is reported
+	// as a session error so it kills this session, not the proxy.
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("pg: relay client to upstream: panic: %v\n%s", r, debug.Stack())
+			}
+		}()
+
 		done <- copyMessages(upstream, clientR)
 	}()
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("pg: relay upstream to client: panic: %v\n%s", r, debug.Stack())
+			}
+		}()
+
 		if _, err := io.Copy(client, upstream); err != nil {
 			done <- fmt.Errorf("pg: copy upstream to client: %w", err)
 
