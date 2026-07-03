@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/mickamy/tapaside/internal/exit"
 	"github.com/mickamy/tapaside/internal/proxy"
@@ -22,6 +23,9 @@ func runProxy(args []string, stdout, stderr io.Writer) int {
 
 	listen := fs.String("listen", "127.0.0.1:5433", "address to listen on")
 	upstream := fs.String("upstream", "", "upstream database address (required)")
+	startupTimeout := fs.Duration("startup-timeout", 10*time.Second, "max time for a client to complete startup")
+	drainTimeout := fs.Duration("drain-timeout", 30*time.Second, "max wait for in-flight sessions on shutdown")
+	maxConns := fs.Int("max-conns", 0, "max concurrent sessions (0 = unlimited)")
 
 	if err := fs.Parse(args); err != nil {
 		return exit.Usage
@@ -47,7 +51,13 @@ func runProxy(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintf(stdout, "tapaside proxy listening on %s, upstream %s\n", l.Addr(), *upstream)
 
-	srv := proxy.Server{Upstream: *upstream, Handler: pg.Handler{}, Log: stderr}
+	srv := proxy.Server{
+		Upstream:     *upstream,
+		Handler:      pg.Handler{StartupTimeout: *startupTimeout},
+		Log:          stderr,
+		MaxConns:     *maxConns,
+		DrainTimeout: *drainTimeout,
+	}
 	if err := srv.Serve(ctx, l); err != nil {
 		fmt.Fprintf(stderr, "tapaside: %v\n", err)
 
@@ -69,7 +79,10 @@ func printProxyUsage(w io.Writer) {
 	fmt.Fprintln(w, "well; TLS (verify-full) is planned.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "FLAGS:")
-	fmt.Fprintln(w, "  --listen <addr>     Address to listen on (default: 127.0.0.1:5433)")
-	fmt.Fprintln(w, "  --upstream <addr>   Upstream database address (required)")
-	fmt.Fprintln(w, "  --help, -h          Show this help")
+	fmt.Fprintln(w, "  --listen <addr>          Address to listen on (default: 127.0.0.1:5433)")
+	fmt.Fprintln(w, "  --upstream <addr>        Upstream database address (required)")
+	fmt.Fprintln(w, "  --startup-timeout <dur>  Max time for a client to complete startup (default: 10s)")
+	fmt.Fprintln(w, "  --drain-timeout <dur>    Max wait for in-flight sessions on shutdown (default: 30s)")
+	fmt.Fprintln(w, "  --max-conns <n>          Max concurrent sessions; 0 = unlimited (default: 0)")
+	fmt.Fprintln(w, "  --help, -h               Show this help")
 }
