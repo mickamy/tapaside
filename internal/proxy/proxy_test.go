@@ -473,7 +473,8 @@ func TestServer_MaxConns(t *testing.T) {
 	l := listen(t)
 
 	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
 
 	// Accepted sessions greet with 'x' so the test can tell an accepted
 	// connection from a rejected one, which sees EOF without a greeting.
@@ -504,6 +505,24 @@ func TestServer_MaxConns(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), "connection limit") {
 		t.Errorf("log = %q, want a connection limit notice", log.String())
+	}
+
+	// Ending the first session must free its slot for new connections.
+	releaseOnce()
+
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		conn := dialProxy(t, l.Addr().String())
+		if _, err := io.ReadFull(conn, buf); err == nil && buf[0] == 'x' {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("connection slot was not released after the session ended")
+		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

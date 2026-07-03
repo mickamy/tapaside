@@ -243,6 +243,57 @@ func TestHandler_StartupTimeout(t *testing.T) {
 	}
 }
 
+func TestHandler_StartupDeadlineCleared(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+
+	go func() {
+		conn, err := upstreamL.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+		if _, err := pgwire.ReadStartup(conn); err != nil {
+			return
+		}
+		if _, err := pgwire.ReadMessage(conn); err != nil {
+			return
+		}
+
+		ready := pgwire.Message{Type: 'Z', Payload: []byte("I")}
+		_, _ = ready.WriteTo(conn)
+	}()
+
+	h := pg.Handler{StartupTimeout: 100 * time.Millisecond}
+	client := dialProxy(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+	if _, err := startup.WriteTo(client); err != nil {
+		t.Fatalf("write startup: %v", err)
+	}
+
+	// Idle well past the startup timeout: the deadline must have been
+	// cleared once startup completed, or this session would be killed.
+	time.Sleep(300 * time.Millisecond)
+
+	query := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	if _, err := query.WriteTo(client); err != nil {
+		t.Fatalf("write query: %v", err)
+	}
+
+	ready, err := pgwire.ReadMessage(client)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if ready.Type != 'Z' {
+		t.Errorf("response type = %c, want Z", ready.Type)
+	}
+}
+
 func TestHandler_StartupTimeoutDisabled(t *testing.T) {
 	t.Parallel()
 
