@@ -412,13 +412,24 @@ func copyResponses(clientW *syncWriter, upstream io.Reader, txStatus *atomic.Int
 			continue
 		}
 
-		if _, err := clientW.Write(header[:]); err != nil {
-			return fmt.Errorf("forward backend header: %w", err)
-		}
-		if payloadLen > 0 {
-			if _, err := io.CopyN(clientW, upstream, payloadLen); err != nil {
-				return fmt.Errorf("forward backend payload: %w", err)
+		// Forward header and payload under one lock so a concurrent deny
+		// on the client→upstream pump cannot split this backend message.
+		// The upstream read stays inside the lock to keep streaming (no
+		// whole-message buffering); a blocked query simply waits until the
+		// message is fully forwarded.
+		if err := clientW.withLock(func(w io.Writer) error {
+			if _, err := w.Write(header[:]); err != nil {
+				return fmt.Errorf("forward backend header: %w", err)
 			}
+			if payloadLen > 0 {
+				if _, err := io.CopyN(w, upstream, payloadLen); err != nil {
+					return fmt.Errorf("forward backend payload: %w", err)
+				}
+			}
+
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 }
@@ -438,6 +449,16 @@ func (w *syncWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 
 	return w.w.Write(p) //nolint:wrapcheck // thin serializing wrapper; callers wrap with context
+}
+
+// withLock runs f with the underlying writer while holding the lock, so
+// a multi-step write (a message header followed by a streamed payload)
+// goes out without another goroutine's write interleaving.
+func (w *syncWriter) withLock(f func(io.Writer) error) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return f(w.w)
 }
 
 // writeMessage writes one protocol message in a single locked Write.
