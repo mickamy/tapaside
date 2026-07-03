@@ -70,6 +70,19 @@ func TestReadOnly(t *testing.T) {
 		// Injection-flavored: the write must not hide behind a comment or literal.
 		{name: "write after inline comment", sql: "SELECT 1 /* x */; DELETE FROM t", want: false},
 		{name: "semicolon inside literal is not a split", sql: "SELECT 'a;b'; DELETE FROM t", want: false},
+
+		// Scanner over-consumption PoCs: PostgreSQL would run the write.
+		{name: "cr terminates line comment", sql: "SELECT 1 --x\r; INSERT INTO logs VALUES(1)", want: false},
+		{
+			name: "e-string prefix needs a token boundary",
+			sql:  "SELECT 1 WHERE 'x' LIKE'\\'; INSERT INTO logs VALUES(1); --'",
+			want: false,
+		},
+		{
+			name: "numeric dollar tag is not a dollar quote",
+			sql:  "SELECT $1$; INSERT INTO logs VALUES(1); --$1$",
+			want: false,
+		},
 	}
 
 	for _, tt := range tests {

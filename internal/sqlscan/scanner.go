@@ -47,22 +47,35 @@ func (s *scanner) skippableLen() int {
 		return singleQuoteLen(rest)
 	case rest[0] == '"':
 		return quotedIdentLen(rest)
-	case (rest[0] == 'e' || rest[0] == 'E') && len(rest) > 1 && rest[1] == '\'':
+	case (rest[0] == 'e' || rest[0] == 'E') && len(rest) > 1 && rest[1] == '\'' && s.atTokenStart():
 		// E'...' escape-string: backslashes escape the closing quote.
+		// Only at a token start, so the E of LIKE'...' is not mistaken
+		// for an escape-string prefix.
 		return 1 + escapeStringLen(rest[1:])
 	}
 
-	if tag, ok := dollarTag(rest); ok {
-		return dollarQuoteLen(rest, tag)
+	// A dollar-quote opens only at a token start; otherwise a bare $ is a
+	// positional parameter ($1) or part of an identifier.
+	if s.atTokenStart() {
+		if tag, ok := dollarTag(rest); ok {
+			return dollarQuoteLen(rest, tag)
+		}
 	}
 
 	return 0
 }
 
-// lineCommentLen spans "--" through the end of the line (the newline is
-// left for the caller so it still separates tokens).
+// atTokenStart reports whether the byte at the cursor begins a new
+// token, i.e. the previous byte is absent or is not an identifier byte.
+func (s *scanner) atTokenStart() bool {
+	return s.pos == 0 || !isWordByte(s.src[s.pos-1])
+}
+
+// lineCommentLen spans "--" up to the end of the line. PostgreSQL ends
+// a line comment at either CR or LF, so both are stops; the terminator
+// is left for the caller so it still separates tokens.
 func lineCommentLen(rest string) int {
-	if i := strings.IndexByte(rest, '\n'); i >= 0 {
+	if i := strings.IndexAny(rest, "\r\n"); i >= 0 {
 		return i
 	}
 
@@ -167,7 +180,9 @@ func dollarTag(rest string) (string, bool) {
 		if c == '$' {
 			return rest[:i+1], true
 		}
-		if !isWordByte(c) {
+		// A tag may not start with a digit; PostgreSQL reads $1 as a
+		// positional parameter, not a dollar-quote opening.
+		if !isWordByte(c) || (i == 1 && c >= '0' && c <= '9') {
 			return "", false
 		}
 	}
