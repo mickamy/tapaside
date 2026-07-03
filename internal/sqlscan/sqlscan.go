@@ -12,7 +12,7 @@
 package sqlscan
 
 import (
-	"slices"
+	"iter"
 	"strings"
 )
 
@@ -117,82 +117,90 @@ func Split(sql string) []string {
 }
 
 // classify determines whether a single statement is a read or a write.
+// It short-circuits: a data-modifying verb (or SELECT ... INTO) returns
+// Write the moment it is seen, so a multi-megabyte bulk INSERT is
+// classified from its first word without scanning the payload.
 func classify(stmt string) Kind {
-	words := significantWords(stmt)
-	if len(words) == 0 {
-		return Read
-	}
+	head := ""
 
-	head := words[0]
+	for w := range significantWords(stmt) {
+		if head == "" {
+			head = w
+		}
 
-	// A data-modifying verb anywhere (e.g., inside a CTE) means write.
-	for _, w := range words {
+		// A data-modifying verb anywhere (e.g., inside a CTE) means write.
 		if writeKeywords[w] {
+			return Write
+		}
+
+		// SELECT ... INTO creates a table — the one read-shaped write. It
+		// can sit behind a CTE (WITH ... SELECT ... INTO), so accept a WITH
+		// head too. INSERT ... INTO is already caught by writeKeywords.
+		if (head == "select" || head == "with") && w == "into" {
 			return Write
 		}
 	}
 
-	// SELECT ... INTO creates a table, so it is the one read-shaped write.
-	// It can sit behind a CTE (WITH ... SELECT ... INTO), so this is
-	// checked before the WITH short-circuit below.
-	if (head == "select" || head == "with") && slices.Contains(words, "into") {
+	switch {
+	case head == "": // only whitespace, comments, or empty statements
+		return Read
+	case head == "with": // no write verb was found, so the CTE only reads
+		return Read
+	case readKeywords[head] || controlKeywords[head]:
+		return Read
+	default:
 		return Write
 	}
-
-	if head == "with" {
-		// No write verb was found above, so the CTE body only reads.
-		return Read
-	}
-
-	if readKeywords[head] || controlKeywords[head] {
-		return Read
-	}
-
-	return Write
 }
 
-// significantWords returns the lowercased words of stmt, skipping string
+// significantWords yields the lowercased words of stmt, skipping string
 // literals, quoted identifiers, and comments so that a keyword hidden in
 // a literal is never mistaken for an operative verb. Keywords are ASCII,
 // so bytes are lowercased in place rather than allocating with ToLower.
-func significantWords(stmt string) []string {
-	var (
-		words []string
-		word  strings.Builder
-	)
+// It is a sequence so callers can stop early once they have decided.
+func significantWords(stmt string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		var word strings.Builder
 
-	flush := func() {
-		if word.Len() > 0 {
-			words = append(words, word.String())
+		flush := func() bool {
+			if word.Len() == 0 {
+				return true
+			}
+
+			w := word.String()
 			word.Reset()
+
+			return yield(w)
 		}
+
+		s := scanner{src: stmt}
+		for s.pos < len(s.src) {
+			if n := s.skippableLen(); n > 0 {
+				if !flush() {
+					return
+				}
+				s.pos += n
+
+				continue
+			}
+
+			c := s.src[s.pos]
+			switch {
+			case c >= 'A' && c <= 'Z':
+				word.WriteByte(c + ('a' - 'A'))
+			case isWordByte(c):
+				word.WriteByte(c)
+			default:
+				if !flush() {
+					return
+				}
+			}
+
+			s.pos++
+		}
+
+		flush()
 	}
-
-	s := scanner{src: stmt}
-	for s.pos < len(s.src) {
-		if n := s.skippableLen(); n > 0 {
-			flush()
-			s.pos += n
-
-			continue
-		}
-
-		c := s.src[s.pos]
-		switch {
-		case c >= 'A' && c <= 'Z':
-			word.WriteByte(c + ('a' - 'A'))
-		case isWordByte(c):
-			word.WriteByte(c)
-		default:
-			flush()
-		}
-
-		s.pos++
-	}
-
-	flush()
-
-	return words
 }
 
 func isWordByte(c byte) bool {

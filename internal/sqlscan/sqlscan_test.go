@@ -2,6 +2,7 @@ package sqlscan_test
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/mickamy/tapaside/internal/sqlscan"
@@ -94,6 +95,21 @@ func TestReadOnly(t *testing.T) {
 				t.Errorf("ReadOnly(%q) = %v, want %v", tt.sql, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestReadOnly_LargeStatements(t *testing.T) {
+	t.Parallel()
+
+	// classify short-circuits on the first word; a huge payload must not
+	// change the verdict for either a write or a read.
+	tuples := strings.Repeat("(1,'x'),", 100_000)
+
+	if sqlscan.ReadOnly("INSERT INTO t VALUES " + tuples + "(1,'x')") {
+		t.Error("large INSERT classified as read-only")
+	}
+	if !sqlscan.ReadOnly("SELECT " + strings.Repeat("col, ", 100_000) + "col FROM t") {
+		t.Error("large SELECT classified as write")
 	}
 }
 
