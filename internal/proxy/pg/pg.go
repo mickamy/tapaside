@@ -30,7 +30,8 @@ const defaultStartupTimeout = 10 * time.Second
 type Handler struct {
 	// StartupTimeout bounds how long a client may take to complete the
 	// startup phase, so an idle or malicious connection cannot hold a
-	// session slot forever. Zero means the default of 10s.
+	// session slot forever. Zero means the default of 10s; a negative
+	// value disables the timeout.
 	StartupTimeout time.Duration
 }
 
@@ -43,8 +44,10 @@ func (h Handler) ServeConn(ctx context.Context, client net.Conn, dial proxy.Dial
 		timeout = defaultStartupTimeout
 	}
 
-	if err := client.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return fmt.Errorf("pg: set startup deadline: %w", err)
+	if timeout > 0 {
+		if err := client.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return fmt.Errorf("pg: set startup deadline: %w", err)
+		}
 	}
 
 	clientR := bufio.NewReader(client)
