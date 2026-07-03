@@ -47,6 +47,12 @@ func TestReadOnly(t *testing.T) {
 		{name: "discard all", sql: "DISCARD ALL", want: true},
 		{name: "transaction wrapping reads", sql: "BEGIN; SELECT 1; COMMIT", want: true},
 
+		// Cursor operations: reads under a read-only policy.
+		{name: "declare cursor", sql: "DECLARE c CURSOR FOR SELECT * FROM t", want: true},
+		{name: "fetch", sql: "FETCH ALL FROM c", want: true},
+		{name: "move", sql: "MOVE FORWARD 5 IN c", want: true},
+		{name: "close cursor", sql: "CLOSE c", want: true},
+
 		// Writes.
 		{name: "insert", sql: "INSERT INTO users VALUES (1)", want: false},
 		{name: "update", sql: "UPDATE users SET x = 1", want: false},
@@ -68,6 +74,11 @@ func TestReadOnly(t *testing.T) {
 		{name: "call procedure", sql: "CALL do_stuff()", want: false},
 		{name: "do block", sql: "DO $$ BEGIN DELETE FROM t; END $$", want: false},
 		{name: "transaction wrapping a write", sql: "BEGIN; DELETE FROM t; COMMIT", want: false},
+		{
+			name: "cursor over a data-modifying cte",
+			sql:  "DECLARE c CURSOR FOR WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+			want: false,
+		},
 
 		// Injection-flavored: the write must not hide behind a comment or literal.
 		{name: "write after inline comment", sql: "SELECT 1 /* x */; DELETE FROM t", want: false},

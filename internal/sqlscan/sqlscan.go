@@ -31,12 +31,21 @@ const (
 // WITH is included because a CTE most often feeds a SELECT, but a
 // data-modifying CTE (WITH ... INSERT/UPDATE/DELETE) exists, so WITH is
 // resolved by scanning past the CTE rather than trusting the prefix.
+//
+// Cursor operations (DECLARE/FETCH/MOVE/CLOSE) are reads: a cursor can
+// only be declared over a query, and a data-modifying body still trips
+// the write-keyword scan, so allowing them lets read-only clients stream
+// large results with cursors.
 var readKeywords = map[string]bool{
 	"select":  true,
 	"show":    true,
 	"values":  true,
 	"table":   true,
 	"explain": true,
+	"declare": true,
+	"fetch":   true,
+	"move":    true,
+	"close":   true,
 }
 
 // writeKeywords are keywords that force a Write verdict wherever they
