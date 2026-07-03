@@ -30,12 +30,12 @@ func listen(t *testing.T) net.Listener {
 	return l
 }
 
-func startProxy(t *testing.T, upstream string) string {
+func startProxy(t *testing.T, upstream string, h pg.Handler) string {
 	t.Helper()
 
 	l := listen(t)
 
-	srv := proxy.Server{Upstream: upstream, Handler: pg.Handler{}}
+	srv := proxy.Server{Upstream: upstream, Handler: h}
 	go func() { _ = srv.Serve(t.Context(), l) }()
 
 	return l.Addr().String()
@@ -116,7 +116,7 @@ func TestHandler_Relay(t *testing.T) {
 		resCh <- res
 	}()
 
-	client := dialProxy(t, startProxy(t, upstreamL.Addr().String()))
+	client := dialProxy(t, startProxy(t, upstreamL.Addr().String(), pg.Handler{}))
 
 	// The client side of the sidecar is plaintext: SSLRequest is denied.
 	if _, err := (pgwire.StartupMessage{Code: pgwire.SSLRequestCode}).WriteTo(client); err != nil {
@@ -206,7 +206,7 @@ func TestHandler_CancelRequest(t *testing.T) {
 		resCh <- upstreamResult{startup: startup}
 	}()
 
-	client := dialProxy(t, startProxy(t, upstreamL.Addr().String()))
+	client := dialProxy(t, startProxy(t, upstreamL.Addr().String(), pg.Handler{}))
 
 	cancelPayload := []byte{0, 0, 0, 1, 0, 0, 0, 2} // pid, secret key
 	cancel := pgwire.StartupMessage{Code: pgwire.CancelRequestCode, Payload: cancelPayload}
@@ -228,11 +228,24 @@ func TestHandler_CancelRequest(t *testing.T) {
 	}
 }
 
+func TestHandler_StartupTimeout(t *testing.T) {
+	t.Parallel()
+
+	// The upstream is never dialed; the client never sends a startup.
+	h := pg.Handler{StartupTimeout: 50 * time.Millisecond}
+	client := dialProxy(t, startProxy(t, "127.0.0.1:1", h))
+
+	buf := make([]byte, 1)
+	if _, err := client.Read(buf); !errors.Is(err, io.EOF) {
+		t.Errorf("read = %v, want io.EOF after the startup timeout", err)
+	}
+}
+
 func TestHandler_TooManyEncryptionRequests(t *testing.T) {
 	t.Parallel()
 
 	// The upstream is never dialed; any address will do.
-	client := dialProxy(t, startProxy(t, "127.0.0.1:1"))
+	client := dialProxy(t, startProxy(t, "127.0.0.1:1", pg.Handler{}))
 
 	// 3 mirrors maxStartupReads: every read was an encryption request,
 	// so the proxy gives up and closes the connection.
@@ -325,7 +338,7 @@ func TestHandler_UpstreamUnreachable(t *testing.T) {
 	addr := l.Addr().String()
 	_ = l.Close()
 
-	client := dialProxy(t, startProxy(t, addr))
+	client := dialProxy(t, startProxy(t, addr, pg.Handler{}))
 
 	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
 	if _, err := startup.WriteTo(client); err != nil {

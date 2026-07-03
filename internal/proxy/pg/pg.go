@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"runtime/debug"
+	"time"
 
 	"github.com/mickamy/tapaside/internal/pgwire"
 	"github.com/mickamy/tapaside/internal/proxy"
@@ -21,19 +22,41 @@ import (
 // (each denied with 'N'), then the actual startup message.
 const maxStartupReads = 3
 
+const defaultStartupTimeout = 10 * time.Second
+
 // Handler drives one PostgreSQL client connection. Policy evaluation
 // and audit output will land here.
-type Handler struct{}
+type Handler struct {
+	// StartupTimeout bounds how long a client may take to complete the
+	// startup phase, so an idle or malicious connection cannot hold a
+	// session slot forever. Zero means the default of 10s.
+	StartupTimeout time.Duration
+}
 
 var _ proxy.Handler = (*Handler)(nil)
 
 // ServeConn implements proxy.Handler.
 func (h Handler) ServeConn(ctx context.Context, client net.Conn, dial proxy.Dialer) error {
+	timeout := h.StartupTimeout
+	if timeout == 0 {
+		timeout = defaultStartupTimeout
+	}
+
+	if err := client.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("pg: set startup deadline: %w", err)
+	}
+
 	clientR := bufio.NewReader(client)
 
 	startup, err := negotiateStartup(client, clientR)
 	if err != nil {
 		return err
+	}
+
+	// The startup phase is over; established sessions may legitimately
+	// idle for a long time (connection pools), so no relay deadline.
+	if err := client.SetReadDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("pg: clear startup deadline: %w", err)
 	}
 
 	upstream, err := dial(ctx)
