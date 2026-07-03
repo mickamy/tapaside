@@ -11,10 +11,12 @@ import (
 	"io"
 	"net"
 	"runtime/debug"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/mickamy/tapaside/internal/pgwire"
+	"github.com/mickamy/tapaside/internal/policy"
 	"github.com/mickamy/tapaside/internal/proxy"
 )
 
@@ -25,14 +27,17 @@ const maxStartupReads = 3
 
 const defaultStartupTimeout = 10 * time.Second
 
-// Handler drives one PostgreSQL client connection. Policy evaluation
-// and audit output will land here.
+// Handler drives one PostgreSQL client connection, evaluating each
+// query against Policy before it reaches the database.
 type Handler struct {
 	// StartupTimeout bounds how long a client may take to complete the
 	// startup phase, so an idle or malicious connection cannot hold a
 	// session slot forever. Zero means the default of 10s; a negative
 	// value disables the timeout.
 	StartupTimeout time.Duration
+	// Policy is evaluated for every simple query. The zero value allows
+	// everything.
+	Policy policy.Policy
 }
 
 var _ proxy.Handler = (*Handler)(nil)
@@ -78,7 +83,7 @@ func (h Handler) ServeConn(ctx context.Context, client net.Conn, dial proxy.Dial
 		return nil
 	}
 
-	return relay(client, clientR, upstream)
+	return relay(client, clientR, upstream, h.Policy)
 }
 
 // negotiateStartup reads startup-phase messages from the client until
@@ -131,8 +136,13 @@ type pumpResult struct {
 // disconnect included — the first result is the causal one: both
 // connections are closed to unblock the other pump, whose late error
 // is noise.
-func relay(client net.Conn, clientR io.Reader, upstream net.Conn) error {
+func relay(client net.Conn, clientR io.Reader, upstream net.Conn, pol policy.Policy) error {
 	done := make(chan pumpResult, 2)
+
+	// Both directions may write to the client: the upstream copy below
+	// and the synthetic responses copyMessages sends for blocked
+	// queries. Serialize them so the two never interleave a write.
+	clientW := &syncWriter{w: client}
 
 	// Each pump sends exactly one result to done, even when it panics;
 	// the receives below rely on that. A recovered panic is reported as
@@ -144,7 +154,7 @@ func relay(client net.Conn, clientR io.Reader, upstream net.Conn) error {
 			}
 		}()
 
-		halfClose, err := copyMessages(upstream, clientR)
+		halfClose, err := copyMessages(upstream, clientW, clientR, pol)
 		done <- pumpResult{halfClose: halfClose, err: err}
 	}()
 	go func() {
@@ -154,7 +164,7 @@ func relay(client net.Conn, clientR io.Reader, upstream net.Conn) error {
 			}
 		}()
 
-		if _, err := io.Copy(client, upstream); err != nil && !isDisconnect(err) {
+		if _, err := io.Copy(clientW, upstream); err != nil && !isDisconnect(err) {
 			done <- pumpResult{err: fmt.Errorf("pg: copy upstream to client: %w", err)}
 
 			return
@@ -183,11 +193,16 @@ func relay(client net.Conn, clientR io.Reader, upstream net.Conn) error {
 	return first.err
 }
 
-// copyMessages relays framed messages from src until it disconnects.
+// copyMessages relays framed client messages to the upstream until the
+// client disconnects, evaluating each simple query against pol first. A
+// blocked query is not forwarded; the proxy answers it directly on
+// clientW with an ErrorResponse and a ReadyForQuery, exactly as the
+// backend would after refusing a statement.
+//
 // It reports halfClose only for a clean EOF on a message boundary — the
 // one case where the client deliberately shut down its write side and
 // may still be waiting for responses.
-func copyMessages(dst io.Writer, src io.Reader) (halfClose bool, _ error) {
+func copyMessages(upstream, clientW io.Writer, src io.Reader, pol policy.Policy) (halfClose bool, _ error) {
 	for {
 		m, err := pgwire.ReadMessage(src)
 		if err != nil {
@@ -201,7 +216,21 @@ func copyMessages(dst io.Writer, src io.Reader) (halfClose bool, _ error) {
 			return false, fmt.Errorf("read client message: %w", err)
 		}
 
-		if _, err := m.WriteTo(dst); err != nil {
+		if m.IsQuery() {
+			if res := pol.Evaluate(m.QueryText()); res.Decision == policy.Blocked {
+				if err := deny(clientW, res); err != nil {
+					if isDisconnect(err) {
+						return false, nil
+					}
+
+					return false, err
+				}
+
+				continue // the query never reaches the database
+			}
+		}
+
+		if _, err := m.WriteTo(upstream); err != nil {
 			if isDisconnect(err) {
 				return false, nil
 			}
@@ -209,6 +238,42 @@ func copyMessages(dst io.Writer, src io.Reader) (halfClose bool, _ error) {
 			return false, fmt.Errorf("forward client message: %w", err)
 		}
 	}
+}
+
+// deny answers a blocked query on w the way the backend answers a
+// rejected statement: an ErrorResponse followed by ReadyForQuery so the
+// client leaves its busy state and can send the next query.
+func deny(w io.Writer, res policy.Result) error {
+	msg := fmt.Sprintf("blocked by tapaside policy (%s)", res.Rule)
+
+	// 42501 is insufficient_privilege, the closest standard SQLSTATE for
+	// "the gateway refused this", and one clients surface as a normal
+	// permission error rather than a connection fault.
+	if _, err := pgwire.ErrorResponse("42501", msg).WriteTo(w); err != nil {
+		return fmt.Errorf("pg: write deny response: %w", err)
+	}
+
+	if _, err := pgwire.ReadyForQuery('I').WriteTo(w); err != nil {
+		return fmt.Errorf("pg: write ready after deny: %w", err)
+	}
+
+	return nil
+}
+
+// syncWriter serializes concurrent writes to the client connection.
+// Both relay directions target it, so its lock keeps the upstream copy
+// and a synthetic deny response from interleaving. Errors pass through
+// unwrapped; callers add context.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.w.Write(p) //nolint:wrapcheck // thin serializing wrapper; callers wrap with context
 }
 
 // isDisconnect reports whether err is one of the errors a vanished or
