@@ -305,6 +305,148 @@ func TestServer_ListenerClose(t *testing.T) {
 	}
 }
 
+func TestServer_DrainWaitsForSessions(t *testing.T) {
+	t.Parallel()
+
+	l := listen(t)
+	ctx, cancel := context.WithCancel(t.Context())
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	h := handlerFunc(func(context.Context, net.Conn, proxy.Dialer) error {
+		close(started)
+		<-release
+
+		return nil
+	})
+
+	srv := proxy.Server{Upstream: "127.0.0.1:1", Handler: h}
+
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, l) }()
+
+	dialProxy(t, l.Addr().String())
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not start")
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+		t.Fatal("Serve() returned before the in-flight session finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Serve() = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("Serve() did not return after the session finished")
+	}
+}
+
+func TestServer_DrainTimeout(t *testing.T) {
+	t.Parallel()
+
+	l := listen(t)
+	ctx, cancel := context.WithCancel(t.Context())
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	h := handlerFunc(func(context.Context, net.Conn, proxy.Dialer) error {
+		close(started)
+		<-release
+
+		return nil
+	})
+
+	var log syncBuffer
+
+	srv := proxy.Server{
+		Upstream:     "127.0.0.1:1",
+		Handler:      h,
+		Log:          &log,
+		DrainTimeout: 50 * time.Millisecond,
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, l) }()
+
+	dialProxy(t, l.Addr().String())
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not start")
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Serve() = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve() did not return after the drain timeout")
+	}
+
+	if !strings.Contains(log.String(), "abandoning") {
+		t.Errorf("log = %q, want a drain timeout notice", log.String())
+	}
+}
+
+func TestServer_MaxConns(t *testing.T) {
+	t.Parallel()
+
+	l := listen(t)
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	// Accepted sessions greet with 'x' so the test can tell an accepted
+	// connection from a rejected one, which sees EOF without a greeting.
+	h := handlerFunc(func(_ context.Context, conn net.Conn, _ proxy.Dialer) error {
+		if _, err := conn.Write([]byte{'x'}); err != nil {
+			return fmt.Errorf("greet: %w", err)
+		}
+		<-release
+
+		return nil
+	})
+
+	var log syncBuffer
+
+	srv := proxy.Server{Upstream: "127.0.0.1:1", Handler: h, Log: &log, MaxConns: 1}
+	go func() { _ = srv.Serve(t.Context(), l) }()
+
+	first := dialProxy(t, l.Addr().String())
+
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(first, buf); err != nil || buf[0] != 'x' {
+		t.Fatalf("first conn: read = %q, %v; want greeting", buf, err)
+	}
+
+	second := dialProxy(t, l.Addr().String())
+	if _, err := second.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("second conn: read = %v, want io.EOF (rejected over the limit)", err)
+	}
+	if !strings.Contains(log.String(), "connection limit") {
+		t.Errorf("log = %q, want a connection limit notice", log.String())
+	}
+}
+
 func TestServer_ContextCancel(t *testing.T) {
 	t.Parallel()
 

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"runtime/debug"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -37,16 +38,24 @@ type Server struct {
 	Upstream string
 	// Handler drives accepted connections. Required.
 	Handler Handler
-	// Log receives connection-level error lines. Nil disables logging.
+	// Log receives connection-level error lines. Sessions write to it
+	// concurrently, so it must be safe for concurrent use (os.File is).
+	// Nil disables logging.
 	Log io.Writer
+	// MaxConns caps concurrent sessions; connections beyond the cap are
+	// closed as soon as they are accepted. Zero means no limit.
+	MaxConns int
+	// DrainTimeout bounds how long Serve waits for in-flight sessions
+	// after shutdown before abandoning them. Zero means wait forever.
+	DrainTimeout time.Duration
 }
 
 // Serve accepts connections on l until ctx is canceled or the listener
 // is closed; both count as a clean shutdown. Temporary accept failures
 // (e.g., file descriptor exhaustion) are retried with backoff instead
 // of stopping the proxy. Cancellation closes the listener; in-flight
-// sessions run detached from ctx so they are not interrupted, and they
-// end when either side closes the connection.
+// sessions run detached from ctx so they are not interrupted, and
+// Serve returns only after they finish or DrainTimeout elapses.
 func (s Server) Serve(ctx context.Context, l net.Listener) error {
 	if s.Handler == nil {
 		return errors.New("proxy: nil handler")
@@ -55,13 +64,22 @@ func (s Server) Serve(ctx context.Context, l net.Listener) error {
 	stop := context.AfterFunc(ctx, func() { _ = l.Close() })
 	defer stop()
 
-	var delay time.Duration
+	var (
+		sessions  sync.WaitGroup
+		sem       chan struct{}
+		delay     time.Duration
+		acceptErr error
+	)
+
+	if s.MaxConns > 0 {
+		sem = make(chan struct{}, s.MaxConns)
+	}
 
 	for {
 		conn, err := l.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return nil
+				break
 			}
 
 			// The runtime already retries EINTR and ECONNABORTED inside
@@ -76,20 +94,70 @@ func (s Server) Serve(ctx context.Context, l net.Listener) error {
 
 				s.logf("accept: %v; retrying in %v\n", err, delay)
 
+				// On cancellation the next Accept reports net.ErrClosed.
 				select {
 				case <-time.After(delay):
-					continue
 				case <-ctx.Done():
-					return nil
 				}
+
+				continue
 			}
 
-			return fmt.Errorf("proxy: accept: %w", err)
+			acceptErr = fmt.Errorf("proxy: accept: %w", err)
+
+			break
 		}
 
 		delay = 0
 
-		go s.handle(context.WithoutCancel(ctx), conn)
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+			default:
+				s.logf("session %s: rejected: connection limit %d reached\n", conn.RemoteAddr(), s.MaxConns)
+				_ = conn.Close()
+
+				continue
+			}
+		}
+
+		sessions.Go(func() {
+			if sem != nil {
+				defer func() { <-sem }()
+			}
+
+			s.handle(context.WithoutCancel(ctx), conn)
+		})
+	}
+
+	if !s.drain(&sessions) {
+		s.logf("shutdown: sessions still running after %v; abandoning them\n", s.DrainTimeout)
+	}
+
+	return acceptErr
+}
+
+// drain waits for in-flight sessions and reports false when
+// DrainTimeout elapses first.
+func (s Server) drain(sessions *sync.WaitGroup) bool {
+	done := make(chan struct{})
+
+	go func() {
+		sessions.Wait()
+		close(done)
+	}()
+
+	if s.DrainTimeout <= 0 {
+		<-done
+
+		return true
+	}
+
+	select {
+	case <-done:
+		return true
+	case <-time.After(s.DrainTimeout):
+		return false
 	}
 }
 
