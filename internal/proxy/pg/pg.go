@@ -35,8 +35,10 @@ type Handler struct {
 	// session slot forever. Zero means the default of 10s; a negative
 	// value disables the timeout.
 	StartupTimeout time.Duration
-	// Policy is evaluated for every simple query. The zero value allows
-	// everything.
+	// Policy is evaluated for every simple query; while it enforces
+	// anything, message types whose SQL cannot be evaluated (the extended
+	// query protocol, fast-path calls) are refused rather than forwarded.
+	// The zero value allows everything and relays transparently.
 	Policy policy.Policy
 }
 
@@ -307,11 +309,10 @@ func (f *msgFilter) handle(m pgwire.Message) (bool, error) {
 		return true, f.clientW.writeMessage(pgwire.ErrorResponse("0A000", extendedNotSupported))
 	case msgFunctionCall:
 		// Fast-path is not followed by Sync; answer it on its own.
-		if err := f.clientW.writeMessage(pgwire.ErrorResponse("0A000", fastPathNotSupported)); err != nil {
-			return true, err
-		}
-
-		return true, f.clientW.writeMessage(pgwire.ReadyForQuery('I'))
+		return true, f.clientW.writeMessages(
+			pgwire.ErrorResponse("0A000", fastPathNotSupported),
+			pgwire.ReadyForQuery('I'),
+		)
 	}
 
 	return false, nil
@@ -329,13 +330,11 @@ const (
 func (f *msgFilter) denyQuery(res policy.Result) error {
 	// 42501 is insufficient_privilege, the closest standard SQLSTATE for
 	// "the gateway refused this", and one clients surface as a normal
-	// permission error rather than a connection fault.
+	// permission error rather than a connection fault. The ErrorResponse
+	// and ReadyForQuery go out together so nothing can split the pair.
 	msg := fmt.Sprintf("blocked by tapaside policy (%s)", res.Rule)
-	if err := f.clientW.writeMessage(pgwire.ErrorResponse("42501", msg)); err != nil {
-		return err
-	}
 
-	return f.clientW.writeMessage(pgwire.ReadyForQuery('I'))
+	return f.clientW.writeMessages(pgwire.ErrorResponse("42501", msg), pgwire.ReadyForQuery('I'))
 }
 
 // syncWriter serializes concurrent writes to the client connection.
@@ -355,16 +354,27 @@ func (w *syncWriter) Write(p []byte) (int, error) {
 	return w.w.Write(p) //nolint:wrapcheck // thin serializing wrapper; callers wrap with context
 }
 
-// writeMessage writes a whole protocol message in one locked Write, so
-// no concurrent upstream bytes can land between its header and payload.
-// Message.WriteTo cannot promise this: on a plain io.Writer net.Buffers
-// falls back to one Write per buffer, releasing the lock in between.
+// writeMessage writes one protocol message in a single locked Write.
 func (w *syncWriter) writeMessage(m pgwire.Message) error {
+	return w.writeMessages(m)
+}
+
+// writeMessages writes the given messages back to back in one locked
+// Write, so no concurrent upstream bytes can land between them — neither
+// inside a single message (Message.WriteTo cannot promise this, since on
+// a plain io.Writer net.Buffers falls back to one Write per buffer) nor
+// between the two messages of a deny response.
+func (w *syncWriter) writeMessages(msgs ...pgwire.Message) error {
+	var buf []byte
+	for _, m := range msgs {
+		buf = append(buf, m.Bytes()...)
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if _, err := w.w.Write(m.Bytes()); err != nil {
-		return fmt.Errorf("pg: write client message: %w", err)
+	if _, err := w.w.Write(buf); err != nil {
+		return fmt.Errorf("pg: write client messages: %w", err)
 	}
 
 	return nil
