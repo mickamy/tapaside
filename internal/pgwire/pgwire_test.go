@@ -292,6 +292,85 @@ func TestReadMessage_EOF(t *testing.T) {
 	}
 }
 
+func TestMessage_QueryText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		m    pgwire.Message
+		want string
+	}{
+		{
+			name: "query with terminator",
+			m:    pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")},
+			want: "SELECT 1",
+		},
+		{
+			name: "query without terminator",
+			m:    pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1")},
+			want: "SELECT 1",
+		},
+		{
+			name: "empty payload",
+			m:    pgwire.Message{Type: 'Q', Payload: nil},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tt.m.QueryText(); got != tt.want {
+				t.Errorf("QueryText() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMessage_IsQuery(t *testing.T) {
+	t.Parallel()
+
+	if !(pgwire.Message{Type: 'Q'}).IsQuery() {
+		t.Error("IsQuery() = false for 'Q', want true")
+	}
+	if (pgwire.Message{Type: 'P'}).IsQuery() {
+		t.Error("IsQuery() = true for 'P', want false")
+	}
+}
+
+func TestErrorResponse(t *testing.T) {
+	t.Parallel()
+
+	m := pgwire.ErrorResponse("42501", "blocked by tapaside policy")
+
+	if m.Type != 'E' {
+		t.Errorf("Type = %c, want E", m.Type)
+	}
+
+	want := "S" + "ERROR" + "\x00" +
+		"V" + "ERROR" + "\x00" +
+		"C" + "42501" + "\x00" +
+		"M" + "blocked by tapaside policy" + "\x00" +
+		"\x00"
+	if got := string(m.Payload); got != want {
+		t.Errorf("Payload = %q, want %q", got, want)
+	}
+}
+
+func TestReadyForQuery(t *testing.T) {
+	t.Parallel()
+
+	m := pgwire.ReadyForQuery('I')
+
+	if m.Type != 'Z' {
+		t.Errorf("Type = %c, want Z", m.Type)
+	}
+	if !bytes.Equal(m.Payload, []byte{'I'}) {
+		t.Errorf("Payload = %v, want ['I']", m.Payload)
+	}
+}
+
 func TestMessage_WriteTo(t *testing.T) {
 	t.Parallel()
 

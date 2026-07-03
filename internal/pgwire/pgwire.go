@@ -3,6 +3,7 @@
 package pgwire
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -92,6 +93,48 @@ func (m StartupMessage) WriteTo(w io.Writer) (int64, error) {
 type Message struct {
 	Type    byte
 	Payload []byte
+}
+
+// IsQuery reports whether m is a simple Query message ('Q').
+func (m Message) IsQuery() bool { return m.Type == 'Q' }
+
+// QueryText returns the SQL of a simple Query message: the payload up
+// to its null terminator. It is meaningful only when IsQuery reports
+// true.
+func (m Message) QueryText() string {
+	s := m.Payload
+	if i := bytes.IndexByte(s, 0); i >= 0 {
+		s = s[:i]
+	}
+
+	return string(s)
+}
+
+// ErrorResponse builds an ErrorResponse message ('E') with severity
+// ERROR, the given SQLSTATE code, and a human-readable message.
+func ErrorResponse(code, message string) Message {
+	var b bytes.Buffer
+
+	field := func(typ byte, val string) {
+		b.WriteByte(typ)
+		b.WriteString(val)
+		b.WriteByte(0)
+	}
+
+	field('S', "ERROR")
+	field('V', "ERROR")
+	field('C', code)
+	field('M', message)
+	b.WriteByte(0)
+
+	return Message{Type: 'E', Payload: b.Bytes()}
+}
+
+// ReadyForQuery builds a ReadyForQuery message ('Z') with the given
+// transaction status: 'I' idle, 'T' in a transaction, 'E' in a failed
+// transaction.
+func ReadyForQuery(status byte) Message {
+	return Message{Type: 'Z', Payload: []byte{status}}
 }
 
 // ReadMessage reads one typed message from r.
