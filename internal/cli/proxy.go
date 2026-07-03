@@ -31,8 +31,22 @@ func runProxy(args []string, stdout, stderr io.Writer) int {
 		return exit.Usage
 	}
 
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "tapaside: unexpected argument %q\n", fs.Arg(0))
+		fmt.Fprintln(stderr, "Run 'tapaside proxy --help' for usage.")
+
+		return exit.Usage
+	}
+
 	if *upstream == "" {
 		fmt.Fprintln(stderr, "tapaside: --upstream is required")
+		fmt.Fprintln(stderr, "Run 'tapaside proxy --help' for usage.")
+
+		return exit.Usage
+	}
+
+	if _, _, err := net.SplitHostPort(*upstream); err != nil {
+		fmt.Fprintf(stderr, "tapaside: invalid --upstream %q: %v\n", *upstream, err)
 		fmt.Fprintln(stderr, "Run 'tapaside proxy --help' for usage.")
 
 		return exit.Usage

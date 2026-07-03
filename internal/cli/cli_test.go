@@ -67,6 +67,18 @@ func TestRun(t *testing.T) {
 			wantCode:   exit.Error,
 			wantStderr: "tapaside:",
 		},
+		{
+			name:       "proxy rejects extra positional arguments",
+			args:       []string{"proxy", "--upstream", "127.0.0.1:5432", "extra"},
+			wantCode:   exit.Usage,
+			wantStderr: "unexpected argument",
+		},
+		{
+			name:       "proxy rejects upstream without a port",
+			args:       []string{"proxy", "--upstream", "db.internal"},
+			wantCode:   exit.Usage,
+			wantStderr: "invalid --upstream",
+		},
 	}
 
 	for _, tt := range tests {
