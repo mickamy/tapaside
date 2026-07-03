@@ -27,8 +27,9 @@ const (
 // Result carries a decision and, when blocked, the rule that blocked it.
 type Result struct {
 	Decision Decision
-	// Rule identifies the matched rule, for audit and error messages.
-	// Empty when the query was allowed.
+	// Rule identifies the matched rule. It appears in the error returned
+	// to the client and will feed audit records once those exist. Empty
+	// when the query was allowed.
 	Rule string
 }
 
