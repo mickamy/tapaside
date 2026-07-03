@@ -57,8 +57,10 @@ type Server struct {
 // is closed; both count as a clean shutdown. Temporary accept failures
 // (e.g., file descriptor exhaustion) are retried with backoff instead
 // of stopping the proxy. Cancellation closes the listener; in-flight
-// sessions run detached from ctx so they are not interrupted, and
-// Serve returns only after they finish or DrainTimeout elapses.
+// sessions keep running detached from ctx while Serve waits up to
+// DrainTimeout, then have their contexts canceled and connections
+// force-closed, with one more DrainTimeout wait before what is left
+// gets abandoned.
 func (s Server) Serve(ctx context.Context, l net.Listener) error {
 	if s.Handler == nil {
 		return errors.New("proxy: nil handler")

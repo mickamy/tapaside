@@ -24,7 +24,7 @@ func runProxy(args []string, stdout, stderr io.Writer) int {
 	listen := fs.String("listen", "127.0.0.1:5433", "address to listen on")
 	upstream := fs.String("upstream", "", "upstream database address (required)")
 	startupTimeout := fs.Duration("startup-timeout", 10*time.Second, "startup phase limit (negative to disable)")
-	drainTimeout := fs.Duration("drain-timeout", 30*time.Second, "max wait for in-flight sessions on shutdown")
+	drainTimeout := fs.Duration("drain-timeout", 30*time.Second, "shutdown drain window (0 = wait forever)")
 	maxConns := fs.Int("max-conns", 1024, "max concurrent sessions (0 = unlimited)")
 
 	if err := fs.Parse(args); err != nil {
@@ -96,7 +96,8 @@ func printProxyUsage(w io.Writer) {
 	fmt.Fprintln(w, "  --listen <addr>          Address to listen on (default: 127.0.0.1:5433)")
 	fmt.Fprintln(w, "  --upstream <addr>        Upstream database address (required)")
 	fmt.Fprintln(w, "  --startup-timeout <dur>  Startup phase limit; negative to disable (default: 10s)")
-	fmt.Fprintln(w, "  --drain-timeout <dur>    Max wait for in-flight sessions on shutdown (default: 30s)")
+	fmt.Fprintln(w, "  --drain-timeout <dur>    Shutdown wait, at most twice: graceful, then after a forced")
+	fmt.Fprintln(w, "                           close; 0 = wait forever, never force (default: 30s)")
 	fmt.Fprintln(w, "  --max-conns <n>          Max concurrent sessions; 0 = unlimited (default: 1024)")
 	fmt.Fprintln(w, "  --help, -h               Show this help")
 }
