@@ -705,6 +705,75 @@ func TestHandler_OversizedBatchIsReleasedEarly(t *testing.T) {
 	}
 }
 
+func TestHandler_ReadOnlyRefusesFastPath(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// A fast-path call names a function by OID, not by SQL: there is
+	// nothing to evaluate, so refusing it is the only guard against
+	// invoking a write function while a policy is active.
+	fastPath := pgwire.Message{Type: 'F', Payload: []byte{0, 0, 0, 1, 0, 0, 0, 0}}
+	writeMessages(t, client, fastPath)
+
+	errResp := expectMessage(t, client, 'E')
+	if !bytes.Contains(errResp.Payload, []byte("C0A000")) {
+		t.Errorf("error payload = %q, want SQLSTATE 0A000", errResp.Payload)
+	}
+
+	expectMessage(t, client, 'Z')
+
+	// The session survives and the call never reached the backend.
+	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	writeMessages(t, client, read)
+
+	backend := backendConn(t, connCh, errCh)
+
+	got := expectMessage(t, backend, 'Q')
+	if !bytes.Equal(got.Payload, read.Payload) {
+		t.Errorf("backend first received %q, want the SELECT %q (the fast-path call leaked through)",
+			got.Payload, read.Payload)
+	}
+}
+
+func TestHandler_OversizedParseIsStillEvaluated(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// A write Parse bigger than the retained scratch takes the one-off
+	// buffer path; its SQL must still be evaluated, never streamed past
+	// the policy.
+	query := "DELETE FROM users WHERE note = '" + strings.Repeat("x", 80<<10) + "'"
+	writeMessages(t, client, parseMsg(query), syncMsg)
+
+	errResp := expectMessage(t, client, 'E')
+	if !bytes.Contains(errResp.Payload, []byte("C42501")) {
+		t.Errorf("error payload = %q, want SQLSTATE 42501", errResp.Payload)
+	}
+
+	expectMessage(t, client, 'Z')
+
+	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	writeMessages(t, client, read)
+
+	backend := backendConn(t, connCh, errCh)
+
+	got := expectMessage(t, backend, 'Q')
+	if !bytes.Equal(got.Payload, read.Payload) {
+		t.Errorf("backend first received %q, want the SELECT %q (the Parse leaked through)",
+			got.Payload, read.Payload)
+	}
+}
+
 func TestHandler_LargeUninspectedMessageStreamsThrough(t *testing.T) {
 	t.Parallel()
 
@@ -1058,6 +1127,44 @@ func TestHandler_TooManyEncryptionRequests(t *testing.T) {
 	buf := make([]byte, 1)
 	if _, err := client.Read(buf); !errors.Is(err, io.EOF) {
 		t.Errorf("read after limit = %v, want io.EOF", err)
+	}
+}
+
+func TestHandler_GSSEncRequestDenied(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	client := dialProxy(t, startProxy(t, upstreamL.Addr().String(), pg.Handler{}))
+
+	// GSSAPI encryption, like SSL, is denied with 'N': the client side
+	// of the sidecar is plaintext by design. The session then proceeds.
+	if _, err := (pgwire.StartupMessage{Code: pgwire.GSSEncRequestCode}).WriteTo(client); err != nil {
+		t.Fatalf("write gssenc request: %v", err)
+	}
+
+	deny := make([]byte, 1)
+	if _, err := io.ReadFull(client, deny); err != nil {
+		t.Fatalf("read gssenc response: %v", err)
+	}
+	if deny[0] != 'N' {
+		t.Fatalf("gssenc response = %q, want 'N'", deny[0])
+	}
+
+	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+	if _, err := startup.WriteTo(client); err != nil {
+		t.Fatalf("write startup: %v", err)
+	}
+
+	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	writeMessages(t, client, read)
+
+	backend := backendConn(t, connCh, errCh)
+
+	got := expectMessage(t, backend, 'Q')
+	if !bytes.Equal(got.Payload, read.Payload) {
+		t.Errorf("backend received %q, want the SELECT %q", got.Payload, read.Payload)
 	}
 }
 
