@@ -3,6 +3,7 @@
 package pgwire
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -94,6 +95,48 @@ type Message struct {
 	Payload []byte
 }
 
+// IsQuery reports whether m is a simple Query message ('Q').
+func (m Message) IsQuery() bool { return m.Type == 'Q' }
+
+// QueryText returns the SQL of a simple Query message: the payload up
+// to its null terminator. It is meaningful only when IsQuery reports
+// true.
+func (m Message) QueryText() string {
+	s := m.Payload
+	if i := bytes.IndexByte(s, 0); i >= 0 {
+		s = s[:i]
+	}
+
+	return string(s)
+}
+
+// ErrorResponse builds an ErrorResponse message ('E') with severity
+// ERROR, the given SQLSTATE code, and a human-readable message.
+func ErrorResponse(code, message string) Message {
+	var b bytes.Buffer
+
+	field := func(typ byte, val string) {
+		b.WriteByte(typ)
+		b.WriteString(val)
+		b.WriteByte(0)
+	}
+
+	field('S', "ERROR")
+	field('V', "ERROR")
+	field('C', code)
+	field('M', message)
+	b.WriteByte(0)
+
+	return Message{Type: 'E', Payload: b.Bytes()}
+}
+
+// ReadyForQuery builds a ReadyForQuery message ('Z') with the given
+// transaction status: 'I' idle, 'T' in a transaction, 'E' in a failed
+// transaction.
+func ReadyForQuery(status byte) Message {
+	return Message{Type: 'Z', Payload: []byte{status}}
+}
+
 // ReadMessage reads one typed message from r.
 func ReadMessage(r io.Reader) (Message, error) {
 	var head [5]byte
@@ -151,6 +194,11 @@ func readPayload(r io.Reader, size int) ([]byte, error) {
 // WriteTo writes the message in wire format. On a net.Conn the header
 // and payload go out in one writev call, without copying the payload
 // into a contiguous buffer.
+//
+// Note that on a plain io.Writer, net.Buffers falls back to one Write
+// per buffer (header, then payload). A caller that shares the writer
+// with another goroutine and needs the message to be indivisible must
+// use Bytes and a single Write instead.
 func (m Message) WriteTo(w io.Writer) (int64, error) {
 	length := 4 + len(m.Payload)
 	if length > maxMessageLength {
@@ -168,4 +216,22 @@ func (m Message) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	return n, nil
+}
+
+// Bytes returns the message in wire format as a single contiguous slice,
+// for callers that must write it in one Write call. It panics if the
+// payload exceeds the protocol limit, which a well-formed message never
+// does.
+func (m Message) Bytes() []byte {
+	length := 4 + len(m.Payload)
+	if length > maxMessageLength {
+		panic(fmt.Sprintf("pgwire: message payload too large: %d bytes", len(m.Payload)))
+	}
+
+	buf := make([]byte, 5+len(m.Payload))
+	buf[0] = m.Type
+	binary.BigEndian.PutUint32(buf[1:5], uint32(length))
+	copy(buf[5:], m.Payload)
+
+	return buf
 }

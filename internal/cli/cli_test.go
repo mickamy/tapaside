@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -54,6 +56,24 @@ func TestRun(t *testing.T) {
 			wantStderr: "not implemented",
 		},
 		{
+			name:       "policy unknown subcommand",
+			args:       []string{"policy", "frobnicate"},
+			wantCode:   exit.Usage,
+			wantStderr: "unknown policy command",
+		},
+		{
+			name:       "policy check requires a file",
+			args:       []string{"policy", "check"},
+			wantCode:   exit.Usage,
+			wantStderr: "exactly one file",
+		},
+		{
+			name:       "policy check missing file",
+			args:       []string{"policy", "check", "/nonexistent/policy.yaml"},
+			wantCode:   exit.Error,
+			wantStderr: "policy:",
+		},
+		{
 			name:       "proxy requires upstream",
 			args:       []string{"proxy"},
 			wantCode:   exit.Usage,
@@ -88,6 +108,12 @@ func TestRun(t *testing.T) {
 			args:       []string{"proxy", "--upstream", "db.internal"},
 			wantCode:   exit.Usage,
 			wantStderr: "invalid --upstream",
+		},
+		{
+			name:       "proxy reports missing policy file",
+			args:       []string{"proxy", "--upstream", "127.0.0.1:5432", "--policy", "/nonexistent/policy.yaml"},
+			wantCode:   exit.Error,
+			wantStderr: "policy:",
 		},
 		{
 			name:       "proxy rejects invalid startup timeout",
@@ -143,6 +169,31 @@ func (a *addrCapture) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func TestRunProxy_WarnsOnPolicyWithNoRules(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := os.WriteFile(path, []byte("read_only: false\n"), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+
+	// An unbindable listen address makes runProxy return after loading
+	// the policy, so the warning is observable without starting a server.
+	code := cli.Run(
+		[]string{"proxy", "--upstream", "127.0.0.1:5432", "--listen", "256.256.256.256:5433", "--policy", path},
+		&stdout, &stderr,
+	)
+
+	if code != exit.Error {
+		t.Errorf("Run() = %d, want %d", code, exit.Error)
+	}
+	if !strings.Contains(stderr.String(), "enables no rules") {
+		t.Errorf("stderr = %q, want a no-rules warning", stderr.String())
+	}
+}
+
 func TestRunProxy_StartupTimeoutWiring(t *testing.T) {
 	t.Parallel()
 
@@ -181,6 +232,46 @@ func TestRunProxy_StartupTimeoutWiring(t *testing.T) {
 	buf := make([]byte, 1)
 	if _, err := conn.Read(buf); !errors.Is(err, io.EOF) {
 		t.Errorf("read = %v, want io.EOF from the startup timeout", err)
+	}
+}
+
+func TestRunPolicyCheck_ValidFile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := os.WriteFile(path, []byte("read_only: true\n"), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+
+	code := cli.Run([]string{"policy", "check", path}, &stdout, &stderr)
+
+	if code != exit.OK {
+		t.Errorf("Run() = %d, want %d (stderr: %s)", code, exit.OK, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "ok") {
+		t.Errorf("stdout = %q, want it to report ok", stdout.String())
+	}
+}
+
+func TestRunPolicyCheck_WarnsOnNoRules(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := os.WriteFile(path, []byte("read_only: false\n"), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+
+	code := cli.Run([]string{"policy", "check", path}, &stdout, &stderr)
+
+	if code != exit.OK {
+		t.Errorf("Run() = %d, want %d", code, exit.OK)
+	}
+	if !strings.Contains(stderr.String(), "enables no rules") {
+		t.Errorf("stderr = %q, want a no-rules warning", stderr.String())
 	}
 }
 

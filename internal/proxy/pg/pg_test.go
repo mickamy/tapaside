@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mickamy/tapaside/internal/pgwire"
+	"github.com/mickamy/tapaside/internal/policy"
 	"github.com/mickamy/tapaside/internal/proxy"
 	"github.com/mickamy/tapaside/internal/proxy/pg"
 )
@@ -168,6 +169,355 @@ func TestHandler_Relay(t *testing.T) {
 	}
 	if res.query.Type != query.Type || !bytes.Equal(res.query.Payload, query.Payload) {
 		t.Errorf("upstream query = %+v, want %+v", res.query, query)
+	}
+}
+
+func TestHandler_ReadOnlyBlocksWrite(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+
+	// The upstream records the first message it receives after startup.
+	// A blocked write must never reach it, so that message must be the
+	// SELECT the client sends afterward.
+	firstQuery := make(chan pgwire.Message, 1)
+	upErr := make(chan error, 1)
+
+	go func() {
+		conn, err := upstreamL.Accept()
+		if err != nil {
+			upErr <- fmt.Errorf("accept: %w", err)
+
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+		if _, err := pgwire.ReadStartup(conn); err != nil {
+			upErr <- fmt.Errorf("read startup: %w", err)
+
+			return
+		}
+
+		m, err := pgwire.ReadMessage(conn)
+		if err != nil {
+			upErr <- fmt.Errorf("read message: %w", err)
+
+			return
+		}
+
+		firstQuery <- m
+	}()
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := dialProxy(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+	if _, err := startup.WriteTo(client); err != nil {
+		t.Fatalf("write startup: %v", err)
+	}
+
+	// A write: the proxy must block it and answer directly.
+	write := pgwire.Message{Type: 'Q', Payload: []byte("DELETE FROM users\x00")}
+	if _, err := write.WriteTo(client); err != nil {
+		t.Fatalf("write blocked query: %v", err)
+	}
+
+	errResp, err := pgwire.ReadMessage(client)
+	if err != nil {
+		t.Fatalf("read error response: %v", err)
+	}
+	if errResp.Type != 'E' {
+		t.Fatalf("response type = %c, want E (ErrorResponse)", errResp.Type)
+	}
+	if !bytes.Contains(errResp.Payload, []byte("tapaside policy")) {
+		t.Errorf("error payload = %q, want it to mention the policy", errResp.Payload)
+	}
+	// SQLSTATE 42501 (insufficient_privilege) so clients treat it as a
+	// permission error, not a connection fault.
+	if !bytes.Contains(errResp.Payload, []byte("C42501")) {
+		t.Errorf("error payload = %q, want SQLSTATE 42501", errResp.Payload)
+	}
+
+	ready, err := pgwire.ReadMessage(client)
+	if err != nil {
+		t.Fatalf("read ready for query: %v", err)
+	}
+	if ready.Type != 'Z' {
+		t.Errorf("response type = %c, want Z (ReadyForQuery)", ready.Type)
+	}
+
+	// A read after the block still reaches the upstream.
+	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	if _, err := read.WriteTo(client); err != nil {
+		t.Fatalf("write allowed query: %v", err)
+	}
+
+	select {
+	case err := <-upErr:
+		t.Fatalf("upstream: %v", err)
+	case got := <-firstQuery:
+		if !bytes.Equal(got.Payload, read.Payload) {
+			t.Errorf("upstream first received %q, want the SELECT %q (the DELETE leaked through)",
+				got.Payload, read.Payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream received no message")
+	}
+}
+
+func TestHandler_DenyReportsTransactionStatus(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+
+	upErr := make(chan error, 1)
+
+	// The fake backend accepts BEGIN and reports it is in a transaction
+	// ('T'); the blocked UPDATE that follows never reaches it.
+	go func() {
+		conn, err := upstreamL.Accept()
+		if err != nil {
+			upErr <- fmt.Errorf("accept: %w", err)
+
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+		if _, err := pgwire.ReadStartup(conn); err != nil {
+			upErr <- fmt.Errorf("read startup: %w", err)
+
+			return
+		}
+
+		if _, err := pgwire.ReadMessage(conn); err != nil { // BEGIN
+			upErr <- fmt.Errorf("read begin: %w", err)
+
+			return
+		}
+
+		// Report the transaction is now open.
+		if _, err := pgwire.ReadyForQuery('T').WriteTo(conn); err != nil {
+			upErr <- fmt.Errorf("write ready(T): %w", err)
+
+			return
+		}
+
+		upErr <- nil
+
+		// Keep the connection open so the proxy's response pump does not
+		// hit EOF and tear down the session while the test exercises the
+		// deny path; unblocks when the proxy closes the conn at cleanup.
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := dialProxy(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+	if _, err := startup.WriteTo(client); err != nil {
+		t.Fatalf("write startup: %v", err)
+	}
+
+	// BEGIN is allowed and forwarded; read the backend's ReadyForQuery('T').
+	begin := pgwire.Message{Type: 'Q', Payload: []byte("BEGIN\x00")}
+	if _, err := begin.WriteTo(client); err != nil {
+		t.Fatalf("write begin: %v", err)
+	}
+
+	ready, err := pgwire.ReadMessage(client)
+	if err != nil {
+		t.Fatalf("read ready after begin: %v", err)
+	}
+	if ready.Type != 'Z' || len(ready.Payload) != 1 || ready.Payload[0] != 'T' {
+		t.Fatalf("ready after begin = %+v, want Z with status T", ready)
+	}
+
+	// A write inside the transaction is blocked; the synthesized
+	// ReadyForQuery must report the failed-transaction state 'E', not 'I',
+	// so the client knows to roll back rather than believe it is idle.
+	write := pgwire.Message{Type: 'Q', Payload: []byte("UPDATE t SET x = 1\x00")}
+	if _, err := write.WriteTo(client); err != nil {
+		t.Fatalf("write blocked update: %v", err)
+	}
+
+	errResp, err := pgwire.ReadMessage(client)
+	if err != nil {
+		t.Fatalf("read error response: %v", err)
+	}
+	if errResp.Type != 'E' {
+		t.Fatalf("response type = %c, want E", errResp.Type)
+	}
+
+	denyReady, err := pgwire.ReadMessage(client)
+	if err != nil {
+		t.Fatalf("read ready after deny: %v", err)
+	}
+	if denyReady.Type != 'Z' || len(denyReady.Payload) != 1 || denyReady.Payload[0] != 'E' {
+		t.Errorf("ready after deny = %+v, want Z with status E (in-transaction deny)", denyReady)
+	}
+
+	if err := <-upErr; err != nil {
+		t.Fatalf("upstream: %v", err)
+	}
+}
+
+func TestHandler_ReadOnlyRefusesExtendedProtocol(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+
+	// Records the first message the upstream sees after startup. The
+	// refused Parse batch must never reach it, so it must be the SELECT.
+	firstQuery := make(chan pgwire.Message, 1)
+	upErr := make(chan error, 1)
+
+	go func() {
+		conn, err := upstreamL.Accept()
+		if err != nil {
+			upErr <- fmt.Errorf("accept: %w", err)
+
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+		if _, err := pgwire.ReadStartup(conn); err != nil {
+			upErr <- fmt.Errorf("read startup: %w", err)
+
+			return
+		}
+
+		m, err := pgwire.ReadMessage(conn)
+		if err != nil {
+			upErr <- fmt.Errorf("read message: %w", err)
+
+			return
+		}
+
+		firstQuery <- m
+	}()
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := dialProxy(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+	if _, err := startup.WriteTo(client); err != nil {
+		t.Fatalf("write startup: %v", err)
+	}
+
+	// An extended-protocol batch: Parse a write, then Sync. Under an
+	// active policy the proxy must refuse the batch, not forward it.
+	parse := pgwire.Message{Type: 'P', Payload: []byte("\x00DELETE FROM users\x00\x00\x00")}
+	if _, err := parse.WriteTo(client); err != nil {
+		t.Fatalf("write parse: %v", err)
+	}
+
+	sync := pgwire.Message{Type: 'S'}
+	if _, err := sync.WriteTo(client); err != nil {
+		t.Fatalf("write sync: %v", err)
+	}
+
+	errResp, err := pgwire.ReadMessage(client)
+	if err != nil {
+		t.Fatalf("read error response: %v", err)
+	}
+	if errResp.Type != 'E' {
+		t.Fatalf("response type = %c, want E (ErrorResponse)", errResp.Type)
+	}
+	if !bytes.Contains(errResp.Payload, []byte("extended query protocol")) {
+		t.Errorf("error payload = %q, want it to explain the extended protocol is unsupported", errResp.Payload)
+	}
+
+	ready, err := pgwire.ReadMessage(client)
+	if err != nil {
+		t.Fatalf("read ready for query: %v", err)
+	}
+	if ready.Type != 'Z' {
+		t.Errorf("response type = %c, want Z (ReadyForQuery)", ready.Type)
+	}
+
+	// The session survives: a simple read afterward reaches the upstream.
+	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	if _, err := read.WriteTo(client); err != nil {
+		t.Fatalf("write allowed query: %v", err)
+	}
+
+	select {
+	case err := <-upErr:
+		t.Fatalf("upstream: %v", err)
+	case got := <-firstQuery:
+		if !bytes.Equal(got.Payload, read.Payload) {
+			t.Errorf("upstream first received %q, want the SELECT %q (the Parse leaked through)",
+				got.Payload, read.Payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream received no message")
+	}
+}
+
+func TestHandler_NoPolicyForwardsExtendedProtocol(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+
+	forwarded := make(chan pgwire.Message, 1)
+	upErr := make(chan error, 1)
+
+	go func() {
+		conn, err := upstreamL.Accept()
+		if err != nil {
+			upErr <- fmt.Errorf("accept: %w", err)
+
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+		if _, err := pgwire.ReadStartup(conn); err != nil {
+			upErr <- fmt.Errorf("read startup: %w", err)
+
+			return
+		}
+
+		m, err := pgwire.ReadMessage(conn)
+		if err != nil {
+			upErr <- fmt.Errorf("read message: %w", err)
+
+			return
+		}
+
+		forwarded <- m
+	}()
+
+	// No policy: the proxy is a transparent relay, so extended-protocol
+	// messages pass through untouched.
+	client := dialProxy(t, startProxy(t, upstreamL.Addr().String(), pg.Handler{}))
+
+	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+	if _, err := startup.WriteTo(client); err != nil {
+		t.Fatalf("write startup: %v", err)
+	}
+
+	parse := pgwire.Message{Type: 'P', Payload: []byte("\x00SELECT 1\x00\x00\x00")}
+	if _, err := parse.WriteTo(client); err != nil {
+		t.Fatalf("write parse: %v", err)
+	}
+
+	select {
+	case err := <-upErr:
+		t.Fatalf("upstream: %v", err)
+	case got := <-forwarded:
+		if got.Type != 'P' || !bytes.Equal(got.Payload, parse.Payload) {
+			t.Errorf("upstream received %+v, want the Parse forwarded verbatim", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream received no message; the Parse was not forwarded")
 	}
 }
 
