@@ -289,7 +289,12 @@ func copyMessages(
 		hdr, err := pgwire.ReadHeader(src)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return true, nil // clean half-close on a message boundary
+				// A clean half-close on a message boundary. A batch still
+				// held for policy evaluation dies with the session, on
+				// purpose: its Sync never came, so the backend owes no
+				// responses, and forwarding a fragment would only leave
+				// the backend waiting for the rest.
+				return true, nil
 			}
 			if isDisconnect(err) {
 				return false, nil // the peer went away; normal for a proxy
