@@ -159,34 +159,70 @@ func ReadyForQuery(status byte) Message {
 	return Message{Type: 'Z', Payload: []byte{status}}
 }
 
-// ReadMessage reads one typed message from r.
-func ReadMessage(r io.Reader) (Message, error) {
+// Header is the frame of a typed message, read ahead of its payload so
+// a relay can decide whether to buffer, hold, or stream the rest.
+type Header struct {
+	Type byte
+	// PayloadLen is the payload size in bytes: the wire-format length
+	// minus its own four bytes.
+	PayloadLen int
+}
+
+// ReadHeader reads and validates the five-byte frame of a typed
+// message from r, leaving the payload unread.
+func ReadHeader(r io.Reader) (Header, error) {
 	var head [5]byte
 	if _, err := io.ReadFull(r, head[:]); err != nil {
-		return Message{}, fmt.Errorf("pgwire: read message header: %w", err)
+		return Header{}, fmt.Errorf("pgwire: read message header: %w", err)
 	}
 
 	length := binary.BigEndian.Uint32(head[1:5])
 	if length < 4 || length > maxMessageLength {
-		return Message{}, fmt.Errorf("pgwire: invalid message length %d", length)
+		return Header{}, fmt.Errorf("pgwire: invalid message length %d", length)
 	}
 
-	payload, err := readPayload(r, int(length-4))
+	return Header{Type: head[0], PayloadLen: int(length - 4)}, nil
+}
+
+// Encode returns the header in wire format. It panics on a payload
+// length outside the protocol limit, which a header read from the wire
+// never carries.
+func (h Header) Encode() [5]byte {
+	if h.PayloadLen < 0 || h.PayloadLen > maxMessageLength-4 {
+		panic(fmt.Sprintf("pgwire: invalid payload length %d", h.PayloadLen))
+	}
+
+	var head [5]byte
+
+	head[0] = h.Type
+	binary.BigEndian.PutUint32(head[1:5], uint32(h.PayloadLen+4))
+
+	return head
+}
+
+// ReadMessage reads one typed message from r.
+func ReadMessage(r io.Reader) (Message, error) {
+	hdr, err := ReadHeader(r)
 	if err != nil {
 		return Message{}, err
 	}
 
-	return Message{Type: head[0], Payload: payload}, nil
+	payload, err := ReadPayload(r, hdr.PayloadLen)
+	if err != nil {
+		return Message{}, err
+	}
+
+	return Message{Type: hdr.Type, Payload: payload}, nil
 }
 
-// readPayload reads size bytes from r, growing the buffer as bytes
+// ReadPayload reads size bytes from r, growing the buffer as bytes
 // arrive instead of trusting size up front, so a peer cannot force a
 // large allocation with a small header alone. The buffer doubles on
 // each growth (append-style ~1.25x growth for large slices would copy
 // ~4.5x the payload in total; doubling keeps it at ~1x). A stream that
 // ends mid-payload reports io.ErrUnexpectedEOF, even at a chunk
 // boundary.
-func readPayload(r io.Reader, size int) ([]byte, error) {
+func ReadPayload(r io.Reader, size int) ([]byte, error) {
 	const chunk = 64 << 10
 
 	payload := make([]byte, 0, min(size, chunk))

@@ -292,6 +292,82 @@ func TestReadMessage_EOF(t *testing.T) {
 	}
 }
 
+func TestReadHeader(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		input   []byte
+		want    pgwire.Header
+		wantErr string
+	}{
+		{
+			name:  "query header",
+			input: messageBytes('Q', []byte("SELECT 1\x00")),
+			want:  pgwire.Header{Type: 'Q', PayloadLen: 9},
+		},
+		{
+			name:  "empty payload",
+			input: messageBytes('S', nil),
+			want:  pgwire.Header{Type: 'S', PayloadLen: 0},
+		},
+		{
+			name:    "length below minimum",
+			input:   []byte{'Q', 0, 0, 0, 3},
+			wantErr: "pgwire: invalid message length",
+		},
+		{
+			name:    "length above maximum",
+			input:   []byte{'Q', 0x40, 0, 0, 1}, // 1<<30 + 1
+			wantErr: "pgwire: invalid message length",
+		},
+		{
+			name:    "truncated header",
+			input:   []byte{'Q', 0, 0},
+			wantErr: "pgwire: read message header",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := pgwire.ReadHeader(bytes.NewReader(tt.input))
+
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("ReadHeader() error = %v, want substring %q", err, tt.wantErr)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("ReadHeader() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("ReadHeader() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHeader_Encode(t *testing.T) {
+	t.Parallel()
+
+	// Encode must reproduce the exact frame ReadHeader consumed.
+	wire := messageBytes('d', []byte("copy data"))
+
+	hdr, err := pgwire.ReadHeader(bytes.NewReader(wire))
+	if err != nil {
+		t.Fatalf("ReadHeader() error = %v", err)
+	}
+
+	if got := hdr.Encode(); !bytes.Equal(got[:], wire[:5]) {
+		t.Errorf("Encode() = %v, want %v", got, wire[:5])
+	}
+}
+
 func TestMessage_QueryText(t *testing.T) {
 	t.Parallel()
 

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -47,6 +48,13 @@ const maxMessageLen = 1 << 30
 // budget (bulk Bind parameters, deep pipelining) is released early,
 // trading that invisibility for bounded memory.
 const maxHeldBytes = 1 << 20
+
+// scratchMax bounds the buffers a session retains for reuse across
+// messages: the scratch that inspected payloads land in and the held
+// batch buffer. Payloads above it use one-off buffers or are streamed,
+// so one unusual message cannot leave every session pinning large
+// memory.
+const scratchMax = 64 << 10
 
 // Handler drives one PostgreSQL client connection, evaluating each
 // query against Policy before it reaches the database.
@@ -226,6 +234,7 @@ func relay(client net.Conn, clientR io.Reader, upstream net.Conn, pol policy.Pol
 // Client message types this handler inspects. See the PostgreSQL
 // frontend/backend protocol for the full set.
 const (
+	msgQuery        = 'Q' // simple query
 	msgParse        = 'P' // extended protocol: define a statement
 	msgBind         = 'B' // extended protocol: bind a portal
 	msgExecute      = 'E' // extended protocol: run a portal
@@ -250,6 +259,11 @@ const (
 // exchange. Fast-path function calls can invoke arbitrary functions and
 // stay refused outright while a policy is active.
 //
+// Only the header of each message is read up front; the payload is then
+// materialized, held, streamed, or discarded depending on what the
+// filter needs from it, so a message the policy never inspects (a bulk
+// CopyData, an oversized Bind) does not have to fit in memory.
+//
 // It reports halfClose only for a clean EOF on a message boundary — the
 // one case where the client deliberately shut down its write side and
 // may still be waiting for responses.
@@ -260,10 +274,10 @@ func copyMessages(
 	pol policy.Policy,
 	txStatus *atomic.Int32,
 ) (halfClose bool, _ error) {
-	f := msgFilter{clientW: clientW, upstream: upstream, pol: pol, enforce: pol.Enforces(), txStatus: txStatus}
+	f := msgFilter{clientW: clientW, upstream: upstream, src: src, pol: pol, enforce: pol.Enforces(), txStatus: txStatus}
 
 	for {
-		m, err := pgwire.ReadMessage(src)
+		hdr, err := pgwire.ReadHeader(src)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return true, nil // clean half-close on a message boundary
@@ -275,7 +289,7 @@ func copyMessages(
 			return false, fmt.Errorf("read client message: %w", err)
 		}
 
-		if err := f.handle(m); err != nil {
+		if err := f.handle(hdr); err != nil {
 			if isDisconnect(err) {
 				return false, nil
 			}
@@ -291,21 +305,26 @@ func copyMessages(
 type msgFilter struct {
 	clientW  *syncWriter
 	upstream io.Writer
+	src      io.Reader
 	pol      policy.Policy
 	enforce  bool
 	// txStatus is the last transaction status the backend reported, so a
 	// synthesized ReadyForQuery can tell the client the truth.
 	txStatus *atomic.Int32
-	// held accumulates the current extended-protocol batch while a
-	// policy is enforced. Forwarding a batch only at its Sync keeps it
-	// all-or-nothing: a deny discards the batch whole, and the backend
-	// is never left holding half a batch whose Sync will not come.
-	held      []pgwire.Message
-	heldBytes int
+	// scratch is reused for payloads the filter materializes, so
+	// steady-state traffic does not allocate per message. Its capacity
+	// is capped at scratchMax.
+	scratch []byte
+	// heldBuf accumulates the current extended-protocol batch in wire
+	// format while a policy is enforced. Forwarding a batch only at its
+	// Sync keeps it all-or-nothing: a deny discards the batch whole, and
+	// the backend is never left holding half a batch whose Sync will not
+	// come.
+	heldBuf []byte
 	// prefixForwarded records that part of the current batch was already
-	// released upstream (a Flush, or a batch that outgrew held), so a
-	// deny can no longer pretend the batch never happened and must
-	// resync through the backend instead.
+	// released upstream (a Flush, or a batch that outgrew the hold
+	// budget), so a deny can no longer pretend the batch never happened
+	// and must resync through the backend instead.
 	prefixForwarded bool
 	// skipUntilSync is set after a batch is denied; the backend discards
 	// a failed batch until Sync, so the proxy does the same.
@@ -329,13 +348,13 @@ func (f *msgFilter) readyStatus() byte {
 	return txFailed
 }
 
-// handle disposes of one client message: forwarded upstream, held for
-// the current batch, answered locally, or discarded during deny
-// recovery.
-func (f *msgFilter) handle(m pgwire.Message) error {
+// handle disposes of one client message, of which only the header has
+// been read: forwarded upstream, held for the current batch, answered
+// locally, or discarded during deny recovery.
+func (f *msgFilter) handle(hdr pgwire.Header) error {
 	if f.skipUntilSync {
-		if m.Type != msgSync {
-			return nil // discard everything until the batch ends
+		if hdr.Type != msgSync {
+			return f.discardPayload(hdr) // swallow until the batch ends
 		}
 
 		f.skipUntilSync = false
@@ -344,30 +363,50 @@ func (f *msgFilter) handle(m pgwire.Message) error {
 			f.forwardSync = false
 			f.prefixForwarded = false
 
-			return f.forward(m)
+			payload, err := f.inspectPayload(hdr)
+			if err != nil {
+				return err
+			}
+
+			return f.forwardBuffered(hdr, payload)
+		}
+
+		if err := f.discardPayload(hdr); err != nil {
+			return err
 		}
 
 		return f.clientW.writeMessage(pgwire.ReadyForQuery(f.readyStatus()))
 	}
 
-	if m.IsQuery() {
+	if !f.enforce {
+		return f.relay(hdr)
+	}
+
+	switch hdr.Type {
+	case msgQuery:
+		payload, err := f.inspectPayload(hdr)
+		if err != nil {
+			return err
+		}
+
 		if err := f.flushHeld(); err != nil {
 			return err
 		}
 
+		m := pgwire.Message{Type: hdr.Type, Payload: payload}
 		if res := f.pol.Evaluate(m.QueryText()); res.Decision == policy.Blocked {
 			return f.denyQuery(res)
 		}
 
-		return f.forward(m)
-	}
-
-	if !f.enforce {
-		return f.forward(m)
-	}
-
-	switch m.Type {
+		return f.forwardBuffered(hdr, payload)
 	case msgParse:
+		payload, err := f.inspectPayload(hdr)
+		if err != nil {
+			return err
+		}
+
+		m := pgwire.Message{Type: hdr.Type, Payload: payload}
+
 		sql, err := m.ParseQueryText()
 		if err != nil {
 			// 08P01 is protocol_violation: the backend answers a Parse it
@@ -379,13 +418,15 @@ func (f *msgFilter) handle(m pgwire.Message) error {
 			return f.denyBatch("42501", fmt.Sprintf("blocked by tapaside policy (%s)", res.Rule))
 		}
 
-		return f.hold(m)
+		return f.hold(hdr, payload)
 	case msgBind, msgExecute, msgDescribe, msgClose:
 		// No SQL of their own; every statement they can reference went
 		// through a Parse this filter already evaluated.
-		return f.hold(m)
+		return f.holdFromWire(hdr)
 	case msgSync:
-		f.held = append(f.held, m)
+		if err := f.holdFromWire(hdr); err != nil {
+			return err
+		}
 		if err := f.flushHeld(); err != nil {
 			return err
 		}
@@ -395,10 +436,16 @@ func (f *msgFilter) handle(m pgwire.Message) error {
 	case msgFlush:
 		// The client wants the responses so far; the held prefix has to
 		// reach the backend for those to exist.
-		f.held = append(f.held, m)
+		if err := f.holdFromWire(hdr); err != nil {
+			return err
+		}
 
 		return f.flushHeld()
 	case msgFunctionCall:
+		if err := f.discardPayload(hdr); err != nil {
+			return err
+		}
+
 		// Fast-path is not followed by Sync; answer it on its own.
 		return f.clientW.writeMessages(
 			pgwire.ErrorResponse("0A000", fastPathNotSupported),
@@ -410,7 +457,7 @@ func (f *msgFilter) handle(m pgwire.Message) error {
 		return err
 	}
 
-	return f.forward(m)
+	return f.relay(hdr)
 }
 
 const (
@@ -418,49 +465,191 @@ const (
 	malformedParse       = "tapaside: malformed Parse message"
 )
 
-// forward writes one message to the upstream.
-func (f *msgFilter) forward(m pgwire.Message) error {
-	if _, err := m.WriteTo(f.upstream); err != nil {
+// inspectPayload reads a payload the filter must look at. Ordinary
+// sizes land in the session scratch buffer, so steady-state inspection
+// does not allocate; an outsized claim falls back to pgwire.ReadPayload,
+// whose buffer grows only as bytes arrive and is not retained.
+func (f *msgFilter) inspectPayload(hdr pgwire.Header) ([]byte, error) {
+	if hdr.PayloadLen > scratchMax {
+		payload, err := pgwire.ReadPayload(f.src, hdr.PayloadLen)
+		if err != nil {
+			return nil, fmt.Errorf("read client message: %w", err)
+		}
+
+		return payload, nil
+	}
+
+	if cap(f.scratch) < hdr.PayloadLen {
+		f.scratch = make([]byte, hdr.PayloadLen)
+	}
+
+	buf := f.scratch[:hdr.PayloadLen]
+	if err := f.readInto(buf); err != nil {
+		return nil, err
+	}
+
+	return buf, nil
+}
+
+// readInto fills buf from the client, reporting a stream that dies
+// mid-payload as ErrUnexpectedEOF so it cannot pass for a clean close
+// on a message boundary.
+func (f *msgFilter) readInto(buf []byte) error {
+	if _, err := io.ReadFull(f.src, buf); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+
+		return fmt.Errorf("read client message payload: %w", err)
+	}
+
+	return nil
+}
+
+// relay forwards one uninspected message. Ordinary sizes are read into
+// the scratch buffer and forwarded in a single write; larger ones are
+// streamed so the proxy never materializes them.
+func (f *msgFilter) relay(hdr pgwire.Header) error {
+	if hdr.PayloadLen > scratchMax {
+		return f.stream(hdr)
+	}
+
+	payload, err := f.inspectPayload(hdr)
+	if err != nil {
+		return err
+	}
+
+	return f.forwardBuffered(hdr, payload)
+}
+
+// stream forwards a message without materializing it: the header, then
+// the payload copied straight from the client to the upstream.
+func (f *msgFilter) stream(hdr pgwire.Header) error {
+	head := hdr.Encode()
+	if _, err := f.upstream.Write(head[:]); err != nil {
+		return fmt.Errorf("forward client message: %w", err)
+	}
+
+	if hdr.PayloadLen > 0 {
+		if _, err := io.CopyN(f.upstream, f.src, int64(hdr.PayloadLen)); err != nil {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+
+			return fmt.Errorf("forward client message: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// forwardBuffered writes an already-read message upstream, header and
+// payload in one writev.
+func (f *msgFilter) forwardBuffered(hdr pgwire.Header, payload []byte) error {
+	if _, err := (pgwire.Message{Type: hdr.Type, Payload: payload}).WriteTo(f.upstream); err != nil {
 		return fmt.Errorf("forward client message: %w", err)
 	}
 
 	return nil
 }
 
-// hold appends an allowed extended-protocol message to the current
-// batch. A batch that outgrows the hold budget is released upstream
-// early; the deny path then resyncs through the backend instead of
-// synthesizing the whole exchange.
-func (f *msgFilter) hold(m pgwire.Message) error {
-	f.held = append(f.held, m)
-	f.heldBytes += 5 + len(m.Payload)
-
-	if f.heldBytes <= maxHeldBytes {
+// discardPayload consumes a swallowed message's payload without
+// materializing it; io.Discard's ReadFrom keeps it allocation-free.
+func (f *msgFilter) discardPayload(hdr pgwire.Header) error {
+	if hdr.PayloadLen == 0 {
 		return nil
 	}
 
-	return f.flushHeld()
+	if _, err := io.CopyN(io.Discard, f.src, int64(hdr.PayloadLen)); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+
+		return fmt.Errorf("discard client message: %w", err)
+	}
+
+	return nil
 }
 
-// flushHeld forwards the held batch upstream and marks the batch as
-// partially released, so a later deny in the same batch knows the
-// backend saw its prefix. The Sync branch of handle resets that mark.
+// holdBudget is how many payload bytes the current batch can still hold,
+// leaving room for the five-byte header.
+func (f *msgFilter) holdBudget() int {
+	return maxHeldBytes - len(f.heldBuf) - 5
+}
+
+// hold appends an already-read message to the current batch, copying it
+// out of the scratch buffer. One whose payload cannot fit the budget is
+// forwarded past the batch instead; the deny path then resyncs through
+// the backend rather than synthesizing the whole exchange.
+func (f *msgFilter) hold(hdr pgwire.Header, payload []byte) error {
+	if hdr.PayloadLen > f.holdBudget() {
+		if err := f.flushHeld(); err != nil {
+			return err
+		}
+		f.prefixForwarded = true
+
+		return f.forwardBuffered(hdr, payload)
+	}
+
+	head := hdr.Encode()
+	f.heldBuf = append(f.heldBuf, head[:]...)
+	f.heldBuf = append(f.heldBuf, payload...)
+
+	return nil
+}
+
+// holdFromWire reads a message's payload straight into the current
+// batch. One that cannot fit the budget is streamed past the batch
+// instead, like hold.
+func (f *msgFilter) holdFromWire(hdr pgwire.Header) error {
+	if hdr.PayloadLen > f.holdBudget() {
+		if err := f.flushHeld(); err != nil {
+			return err
+		}
+		f.prefixForwarded = true
+
+		return f.stream(hdr)
+	}
+
+	head := hdr.Encode()
+	f.heldBuf = append(f.heldBuf, head[:]...)
+
+	start := len(f.heldBuf)
+	f.heldBuf = slices.Grow(f.heldBuf, hdr.PayloadLen)[:start+hdr.PayloadLen]
+
+	return f.readInto(f.heldBuf[start:])
+}
+
+// flushHeld forwards the held batch upstream in one write and marks the
+// batch as partially released, so a later deny in the same batch knows
+// the backend saw its prefix. The Sync branch of handle resets that
+// mark.
 func (f *msgFilter) flushHeld() error {
-	if len(f.held) == 0 {
+	if len(f.heldBuf) == 0 {
 		return nil
 	}
 
-	for _, m := range f.held {
-		if err := f.forward(m); err != nil {
-			return err
-		}
+	if _, err := f.upstream.Write(f.heldBuf); err != nil {
+		return fmt.Errorf("forward client messages: %w", err)
 	}
 
-	f.held = f.held[:0]
-	f.heldBytes = 0
+	f.resetHeld()
 	f.prefixForwarded = true
 
 	return nil
+}
+
+// resetHeld empties the held batch, keeping the buffer for reuse unless
+// it grew unusually large: a session should not pin a budget-sized
+// buffer forever on the strength of one batch.
+func (f *msgFilter) resetHeld() {
+	if cap(f.heldBuf) > scratchMax {
+		f.heldBuf = nil
+
+		return
+	}
+
+	f.heldBuf = f.heldBuf[:0]
 }
 
 // denyBatch refuses the current extended-protocol batch: the held
@@ -470,8 +659,7 @@ func (f *msgFilter) flushHeld() error {
 // the batch already reached the backend, in which case the Sync is
 // forwarded and the backend's own ReadyForQuery closes both ends.
 func (f *msgFilter) denyBatch(code, msg string) error {
-	f.held = f.held[:0]
-	f.heldBytes = 0
+	f.resetHeld()
 	f.skipUntilSync = true
 	f.forwardSync = f.prefixForwarded
 

@@ -705,6 +705,74 @@ func TestHandler_OversizedBatchIsReleasedEarly(t *testing.T) {
 	}
 }
 
+func TestHandler_LargeUninspectedMessageStreamsThrough(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		h    pg.Handler
+	}{
+		{name: "transparent relay", h: pg.Handler{}},
+		{name: "policy active", h: pg.Handler{Policy: policy.Policy{ReadOnly: true}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			upstreamL := listen(t)
+			connCh, errCh := startBackend(t, upstreamL)
+
+			client := startSession(t, startProxy(t, upstreamL.Addr().String(), tt.h))
+
+			// Larger than the retained scratch, so the relay takes the
+			// streaming path; the message must arrive upstream intact.
+			payload := bytes.Repeat([]byte("0123456789abcdef"), (200<<10)/16)
+			writeMessages(t, client, pgwire.Message{Type: 'd', Payload: payload})
+
+			backend := backendConn(t, connCh, errCh)
+
+			got := expectMessage(t, backend, 'd')
+			if !bytes.Equal(got.Payload, payload) {
+				t.Errorf("backend payload = %d bytes, want %d bytes intact", len(got.Payload), len(payload))
+			}
+		})
+	}
+}
+
+func TestHandler_DeniedBatchDiscardsLargeMessages(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// A denied write followed by its bulk Bind: the swallowed remainder
+	// must not wedge the recovery, and nothing of it may leak upstream.
+	bigBind := pgwire.Message{Type: 'B', Payload: make([]byte, 200<<10)}
+	writeMessages(t, client, parseMsg("INSERT INTO t VALUES ($1)"), bigBind, executeUnnamed, syncMsg)
+
+	errResp := expectMessage(t, client, 'E')
+	if !bytes.Contains(errResp.Payload, []byte("C42501")) {
+		t.Errorf("error payload = %q, want SQLSTATE 42501", errResp.Payload)
+	}
+
+	expectMessage(t, client, 'Z')
+
+	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	writeMessages(t, client, read)
+
+	backend := backendConn(t, connCh, errCh)
+
+	got := expectMessage(t, backend, 'Q')
+	if !bytes.Equal(got.Payload, read.Payload) {
+		t.Errorf("backend first received %q, want the SELECT %q (the batch leaked through)",
+			got.Payload, read.Payload)
+	}
+}
+
 func TestHandler_ExtendedDenyReportsTransactionStatus(t *testing.T) {
 	t.Parallel()
 
