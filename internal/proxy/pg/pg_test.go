@@ -1354,15 +1354,46 @@ func TestHandler_UpstreamUnreachable(t *testing.T) {
 	addr := l.Addr().String()
 	_ = l.Close()
 
-	client := dialProxy(t, startProxy(t, addr, pg.Handler{}))
+	client := startSession(t, startProxy(t, addr, pg.Handler{}))
 
-	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
-	if _, err := startup.WriteTo(client); err != nil {
-		t.Fatalf("write startup: %v", err)
+	// The client must learn why the session ends: a FATAL error the way
+	// a backend reports its own startup failures, then the close.
+	errResp := expectMessage(t, client, 'E')
+	if !bytes.Contains(errResp.Payload, []byte("SFATAL")) {
+		t.Errorf("error payload = %q, want severity FATAL", errResp.Payload)
+	}
+	if !bytes.Contains(errResp.Payload, []byte("C08006")) {
+		t.Errorf("error payload = %q, want SQLSTATE 08006", errResp.Payload)
+	}
+	if !bytes.Contains(errResp.Payload, []byte("upstream database is unreachable")) {
+		t.Errorf("error payload = %q, want it to name the upstream failure", errResp.Payload)
 	}
 
 	buf := make([]byte, 1)
 	if _, err := client.Read(buf); !errors.Is(err, io.EOF) {
-		t.Errorf("read after dial failure = %v, want io.EOF", err)
+		t.Errorf("read after error = %v, want io.EOF", err)
+	}
+}
+
+func TestHandler_UpstreamUnreachableCancelRequest(t *testing.T) {
+	t.Parallel()
+
+	// Reserve an address, then close the listener so nothing accepts on it.
+	l := listen(t)
+	addr := l.Addr().String()
+	_ = l.Close()
+
+	client := dialProxy(t, startProxy(t, addr, pg.Handler{}))
+
+	// A cancel request expects no response, dial failure included: the
+	// connection just closes without a synthesized error.
+	cancel := pgwire.StartupMessage{Code: pgwire.CancelRequestCode, Payload: []byte{0, 0, 0, 1, 0, 0, 0, 2}}
+	if _, err := cancel.WriteTo(client); err != nil {
+		t.Fatalf("write cancel request: %v", err)
+	}
+
+	buf := make([]byte, 1)
+	if _, err := client.Read(buf); !errors.Is(err, io.EOF) {
+		t.Errorf("read after cancel dial failure = %v, want io.EOF (no error response)", err)
 	}
 }

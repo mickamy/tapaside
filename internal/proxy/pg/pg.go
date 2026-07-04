@@ -102,6 +102,15 @@ func (h Handler) ServeConn(ctx context.Context, client net.Conn, dial proxy.Dial
 
 	upstream, err := dial(ctx)
 	if err != nil {
+		// The client is mid-startup, waiting for the server's first
+		// message; a backend whose startup fails answers with a FATAL
+		// error before closing, so do the same rather than vanish. A
+		// cancel request expects no response at all. The dial error
+		// itself goes to the server log, not to the client.
+		if !startup.IsCancelRequest() {
+			_, _ = pgwire.FatalResponse("08006", upstreamUnreachable).WriteTo(client)
+		}
+
 		return err
 	}
 	defer func() { _ = upstream.Close() }()
@@ -463,6 +472,7 @@ func (f *msgFilter) handle(hdr pgwire.Header) error {
 const (
 	fastPathNotSupported = "tapaside: fast-path function calls are not supported while a policy is active"
 	malformedParse       = "tapaside: malformed Parse message"
+	upstreamUnreachable  = "tapaside: upstream database is unreachable"
 )
 
 // inspectPayload reads a payload the filter must look at. Ordinary

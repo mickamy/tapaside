@@ -545,6 +545,25 @@ func TestErrorResponse(t *testing.T) {
 	}
 }
 
+func TestFatalResponse(t *testing.T) {
+	t.Parallel()
+
+	m := pgwire.FatalResponse("08006", "upstream unreachable")
+
+	if m.Type != 'E' {
+		t.Errorf("Type = %c, want E", m.Type)
+	}
+
+	want := "S" + "FATAL" + "\x00" +
+		"V" + "FATAL" + "\x00" +
+		"C" + "08006" + "\x00" +
+		"M" + "upstream unreachable" + "\x00" +
+		"\x00"
+	if got := string(m.Payload); got != want {
+		t.Errorf("Payload = %q, want %q", got, want)
+	}
+}
+
 func TestReadyForQuery(t *testing.T) {
 	t.Parallel()
 

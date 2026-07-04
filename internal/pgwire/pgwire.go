@@ -135,6 +135,17 @@ func (m Message) ParseQueryText() (string, error) {
 // ErrorResponse builds an ErrorResponse message ('E') with severity
 // ERROR, the given SQLSTATE code, and a human-readable message.
 func ErrorResponse(code, message string) Message {
+	return errorResponse("ERROR", code, message)
+}
+
+// FatalResponse builds an ErrorResponse message ('E') with severity
+// FATAL, the severity a backend uses for errors that end the session
+// during startup.
+func FatalResponse(code, message string) Message {
+	return errorResponse("FATAL", code, message)
+}
+
+func errorResponse(severity, code, message string) Message {
 	var b bytes.Buffer
 
 	field := func(typ byte, val string) {
@@ -143,8 +154,8 @@ func ErrorResponse(code, message string) Message {
 		b.WriteByte(0)
 	}
 
-	field('S', "ERROR")
-	field('V', "ERROR")
+	field('S', severity)
+	field('V', severity)
 	field('C', code)
 	field('M', message)
 	b.WriteByte(0)
