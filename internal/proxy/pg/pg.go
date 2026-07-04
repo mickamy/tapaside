@@ -679,6 +679,12 @@ func (f *msgFilter) denyBatch(code, msg string) error {
 // denyQuery answers a blocked simple query the way the backend answers a
 // rejected statement: an ErrorResponse followed by ReadyForQuery so the
 // client leaves its busy state and can send the next query.
+//
+// The pair goes out in one write, but it is serialized against backend
+// traffic per message: a client that pipelines simple queries without
+// waiting for ReadyForQuery can see it land between the messages of an
+// earlier query's response stream. Ordering it exactly would take
+// ReadyForQuery accounting on the response pump.
 func (f *msgFilter) denyQuery(res policy.Result) error {
 	// 42501 is insufficient_privilege, the closest standard SQLSTATE for
 	// "the gateway refused this", and one clients surface as a normal
