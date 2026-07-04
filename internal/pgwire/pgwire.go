@@ -98,6 +98,9 @@ type Message struct {
 // IsQuery reports whether m is a simple Query message ('Q').
 func (m Message) IsQuery() bool { return m.Type == 'Q' }
 
+// IsParse reports whether m is an extended-protocol Parse message ('P').
+func (m Message) IsParse() bool { return m.Type == 'P' }
+
 // QueryText returns the SQL of a simple Query message: the payload up
 // to its null terminator. It is meaningful only when IsQuery reports
 // true.
@@ -108,6 +111,25 @@ func (m Message) QueryText() string {
 	}
 
 	return string(s)
+}
+
+// ParseQueryText returns the SQL carried by a Parse message: the query
+// string that follows the statement name in its payload. It is
+// meaningful only when IsParse reports true. A payload missing either
+// null terminator is reported as an error so a caller enforcing a
+// policy can refuse the message instead of evaluating a guess.
+func (m Message) ParseQueryText() (string, error) {
+	_, rest, ok := bytes.Cut(m.Payload, []byte{0})
+	if !ok {
+		return "", errors.New("pgwire: parse message: unterminated statement name")
+	}
+
+	query, _, ok := bytes.Cut(rest, []byte{0})
+	if !ok {
+		return "", errors.New("pgwire: parse message: unterminated query")
+	}
+
+	return string(query), nil
 }
 
 // ErrorResponse builds an ErrorResponse message ('E') with severity

@@ -339,6 +339,117 @@ func TestMessage_IsQuery(t *testing.T) {
 	}
 }
 
+func TestMessage_IsParse(t *testing.T) {
+	t.Parallel()
+
+	if !(pgwire.Message{Type: 'P'}).IsParse() {
+		t.Error("IsParse() = false for 'P', want true")
+	}
+	if (pgwire.Message{Type: 'Q'}).IsParse() {
+		t.Error("IsParse() = true for 'Q', want false")
+	}
+}
+
+// parsePayload builds a Parse message payload: statement name, query
+// (both null-terminated), then a parameter-type count and OIDs.
+func parsePayload(name, query string, paramOIDs ...uint32) []byte {
+	var b bytes.Buffer
+
+	b.WriteString(name)
+	b.WriteByte(0)
+	b.WriteString(query)
+	b.WriteByte(0)
+
+	var count [2]byte
+	binary.BigEndian.PutUint16(count[:], uint16(len(paramOIDs)))
+	b.Write(count[:])
+
+	for _, oid := range paramOIDs {
+		var buf [4]byte
+		binary.BigEndian.PutUint32(buf[:], oid)
+		b.Write(buf[:])
+	}
+
+	return b.Bytes()
+}
+
+func TestMessage_ParseQueryText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		payload []byte
+		want    string
+		wantErr string
+	}{
+		{
+			name:    "named statement",
+			payload: parsePayload("stmt_1", "SELECT id FROM users WHERE id = $1"),
+			want:    "SELECT id FROM users WHERE id = $1",
+		},
+		{
+			name:    "unnamed statement",
+			payload: parsePayload("", "SELECT 1"),
+			want:    "SELECT 1",
+		},
+		{
+			name:    "with parameter type oids",
+			payload: parsePayload("stmt_1", "SELECT $1::int", 23),
+			want:    "SELECT $1::int",
+		},
+		{
+			name:    "empty query",
+			payload: parsePayload("", ""),
+			want:    "",
+		},
+		{
+			name:    "missing parameter count tail",
+			payload: []byte("stmt_1\x00SELECT 1\x00"),
+			want:    "SELECT 1",
+		},
+		{
+			name:    "unterminated statement name",
+			payload: []byte("stmt_1"),
+			wantErr: "unterminated statement name",
+		},
+		{
+			name:    "unterminated query",
+			payload: []byte("stmt_1\x00SELECT 1"),
+			wantErr: "unterminated query",
+		},
+		{
+			name:    "empty payload",
+			payload: nil,
+			wantErr: "unterminated statement name",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := pgwire.Message{Type: 'P', Payload: tt.payload}
+
+			got, err := m.ParseQueryText()
+
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("ParseQueryText() error = %v, want substring %q", err, tt.wantErr)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("ParseQueryText() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("ParseQueryText() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestErrorResponse(t *testing.T) {
 	t.Parallel()
 
