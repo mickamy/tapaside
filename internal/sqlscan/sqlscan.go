@@ -141,9 +141,11 @@ func Split(sql string) []string {
 // Write the moment it is seen, so a multi-megabyte bulk INSERT is
 // classified from its first word without scanning the payload.
 //
-// Words arrive as substrings of stmt (no allocation), compared to
-// keywords with case-insensitive EqualFold; only the head is lowercased,
-// once, for the map lookups.
+// Words arrive as substrings of stmt (no allocation) and are compared to
+// keywords with case-insensitive EqualFold. Lowercasing is limited to
+// map lookups: the head once, plus each EXPLAIN option word while
+// skipping the (bounded) EXPLAIN prefix — never the body of a large
+// statement.
 func classify(stmt string) Kind {
 	head := ""
 	var headStartsCTEOrSelect bool

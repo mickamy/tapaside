@@ -85,7 +85,8 @@ func blockCommentLen(rest string) int {
 	return len(rest) // unterminated: consume the remainder
 }
 
-// singleQuoteLen spans a '...' literal, where ” is an escaped quote.
+// singleQuoteLen spans a '...' literal; inside it a doubled single-quote
+// is an escaped quote, not a terminator.
 func singleQuoteLen(rest string) int {
 	for i := 1; i < len(rest); i++ {
 		if rest[i] != '\'' {
