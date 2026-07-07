@@ -842,6 +842,61 @@ func TestHandler_DeniedBatchDiscardsLargeMessages(t *testing.T) {
 	}
 }
 
+func TestHandler_StalledClientWithDenyIsTornDown(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	// A short write-stall guard so the wedge resolves within the test.
+	l := listen(t)
+	srv := proxy.Server{
+		Upstream:          upstreamL.Addr().String(),
+		Handler:           pg.Handler{Policy: policy.Policy{ReadOnly: true}},
+		WriteStallTimeout: 100 * time.Millisecond,
+	}
+	go func() { _ = srv.Serve(t.Context(), l) }()
+
+	client := startSession(t, l.Addr().String())
+
+	// The adversarial shape: pipeline a read whose response is huge and
+	// a write the policy denies, then stop reading entirely. The deny
+	// waits on the client write lock while the response copy holds it,
+	// blocked on the non-reading client — without the guard, the
+	// session and the upstream connection wedge forever.
+	writeMessages(t, client,
+		pgwire.Message{Type: 'Q', Payload: []byte("SELECT big\x00")},
+		pgwire.Message{Type: 'Q', Payload: []byte("DELETE FROM users\x00")},
+	)
+
+	backend := backendConn(t, connCh, errCh)
+	expectMessage(t, backend, 'Q') // the SELECT arrives
+
+	// The backend answers with more than every buffer on the path can
+	// absorb, so the relay's copy to the client must stall.
+	big := pgwire.Message{Type: 'D', Payload: make([]byte, 8<<20)}
+	wrote := make(chan error, 1)
+
+	go func() {
+		_, err := big.WriteTo(backend)
+		wrote <- err
+	}()
+
+	// Teardown unblocks the backend's write; a wedged session would
+	// leave it blocked forever.
+	select {
+	case <-wrote:
+	case <-time.After(5 * time.Second):
+		t.Fatal("backend write still blocked; the session wedged instead of tearing down")
+	}
+
+	// And the upstream connection is released, not leaked.
+	_ = backend.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := backend.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("backend read after stall = %v, want the connection closed", err)
+	}
+}
+
 func TestHandler_ExtendedDenyReportsTransactionStatus(t *testing.T) {
 	t.Parallel()
 

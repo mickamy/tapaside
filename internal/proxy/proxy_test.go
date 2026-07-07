@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"syscall"
@@ -547,5 +548,100 @@ func TestServer_ContextCancel(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Error("Serve() did not return after cancel")
+	}
+}
+
+func TestStallConn_StalledWriteFails(t *testing.T) {
+	t.Parallel()
+
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+
+	// The peer never reads: the write must fail within the timeout, not
+	// block forever.
+	conn := proxy.NewStallConn(a, 50*time.Millisecond)
+
+	_, err := conn.Write([]byte("hello"))
+
+	if err == nil || !strings.Contains(err.Error(), "write stalled") {
+		t.Fatalf("Write() error = %v, want a write-stall error", err)
+	}
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("Write() error = %v, want os.ErrDeadlineExceeded in the chain", err)
+	}
+}
+
+func TestStallConn_DrainingPeerSurvives(t *testing.T) {
+	t.Parallel()
+
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+
+	// The peer drains slowly but steadily; the whole transfer takes far
+	// longer than the timeout, which must not matter: the deadline is
+	// re-armed per chunk, so only stalled progress trips it.
+	go func() {
+		buf := make([]byte, 64<<10)
+		for {
+			if _, err := b.Read(buf); err != nil {
+				return
+			}
+
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	conn := proxy.NewStallConn(a, 100*time.Millisecond)
+
+	if _, err := conn.Write(make([]byte, 512<<10)); err != nil {
+		t.Errorf("Write() error = %v, want steady progress to keep the session alive", err)
+	}
+}
+
+func TestStallConn_ReadFromStallFails(t *testing.T) {
+	t.Parallel()
+
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+
+	conn := proxy.NewStallConn(a, 50*time.Millisecond)
+
+	// io.Copy takes the ReadFrom path; a non-reading peer must fail it
+	// within the timeout too.
+	_, err := io.Copy(conn, bytes.NewReader(make([]byte, 1<<20)))
+
+	if err == nil || !strings.Contains(err.Error(), "write stalled") {
+		t.Fatalf("Copy() error = %v, want a write-stall error", err)
+	}
+}
+
+func TestServer_WriteStallTearsDownSession(t *testing.T) {
+	t.Parallel()
+
+	l := listen(t)
+
+	served := make(chan error, 1)
+	h := handlerFunc(func(_ context.Context, client net.Conn, _ proxy.Dialer) error {
+		_, err := client.Write(make([]byte, 8<<20))
+		served <- err
+
+		return nil
+	})
+
+	srv := proxy.Server{Upstream: "127.0.0.1:1", Handler: h, WriteStallTimeout: 100 * time.Millisecond}
+	go func() { _ = srv.Serve(t.Context(), l) }()
+
+	// The client connects and never reads; more data than the socket
+	// buffers hold is owed to it, so the session must be torn down
+	// rather than pinned forever.
+	_ = dialProxy(t, l.Addr().String())
+
+	select {
+	case err := <-served:
+		if err == nil || !strings.Contains(err.Error(), "write stalled") {
+			t.Errorf("ServeConn write error = %v, want a write-stall error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not tear down; the stalled write hung")
 	}
 }
