@@ -645,3 +645,32 @@ func TestServer_WriteStallTearsDownSession(t *testing.T) {
 		t.Fatal("session did not tear down; the stalled write hung")
 	}
 }
+
+// shortWriteConn is a net.Conn whose Write claims success without
+// writing anything, violating the io.Writer contract.
+type shortWriteConn struct{}
+
+func (shortWriteConn) Read([]byte) (int, error)    { return 0, io.EOF }
+func (shortWriteConn) Write([]byte) (int, error)   { return 0, nil }
+func (shortWriteConn) Close() error                { return nil }
+func (shortWriteConn) LocalAddr() net.Addr         { return &net.TCPAddr{} }
+func (shortWriteConn) RemoteAddr() net.Addr        { return &net.TCPAddr{} }
+func (shortWriteConn) SetDeadline(time.Time) error { return nil }
+func (shortWriteConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (shortWriteConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func TestStallConn_ShortWriteFailsInsteadOfSpinning(t *testing.T) {
+	t.Parallel()
+
+	conn := proxy.NewStallConn(shortWriteConn{}, time.Second)
+
+	_, err := conn.Write([]byte("hello"))
+
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Errorf("Write() error = %v, want io.ErrShortWrite", err)
+	}
+}

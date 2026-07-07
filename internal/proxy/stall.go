@@ -47,6 +47,11 @@ func (c stallConn) Write(p []byte) (int, error) {
 		if err != nil {
 			return n, c.stallError(err)
 		}
+		if m < chunk {
+			// A conforming net.Conn never reports a short write without
+			// an error; refuse to spin on one that does.
+			return n, io.ErrShortWrite
+		}
 
 		p = p[m:]
 	}
