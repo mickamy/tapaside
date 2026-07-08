@@ -51,7 +51,17 @@ type Server struct {
 	// to DrainTimeout once more before abandoning what is left. Zero
 	// means wait forever and never force-close.
 	DrainTimeout time.Duration
+	// WriteStallTimeout bounds how long a write to the client may go
+	// without progress before the session is torn down, so a client
+	// that stops draining what it is owed cannot pin its session and
+	// connection slot forever. Writes are chunked and the deadline is
+	// re-armed per chunk, so it measures stall, not transfer time; read
+	// idle is untouched. Zero means the default of 30s; a negative
+	// value disables the guard.
+	WriteStallTimeout time.Duration
 }
+
+const defaultWriteStallTimeout = 30 * time.Second
 
 // Serve accepts connections on l until ctx is canceled or the listener
 // is closed; both count as a clean shutdown. Temporary accept failures
@@ -199,6 +209,19 @@ func (s Server) drain(sessions *sync.WaitGroup) bool {
 	}
 }
 
+// writeStallTimeout resolves the configured timeout: zero means the
+// default, negative disables.
+func (s Server) writeStallTimeout() time.Duration {
+	if s.WriteStallTimeout == 0 {
+		return defaultWriteStallTimeout
+	}
+	if s.WriteStallTimeout < 0 {
+		return 0
+	}
+
+	return s.WriteStallTimeout
+}
+
 func (s Server) handle(ctx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 	defer func() {
@@ -207,7 +230,12 @@ func (s Server) handle(ctx context.Context, conn net.Conn) {
 		}
 	}()
 
-	err := s.Handler.ServeConn(ctx, conn, s.dial)
+	client := conn
+	if timeout := s.writeStallTimeout(); timeout > 0 {
+		client = stallConn{Conn: conn, timeout: timeout}
+	}
+
+	err := s.Handler.ServeConn(ctx, client, s.dial)
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 		return
 	}

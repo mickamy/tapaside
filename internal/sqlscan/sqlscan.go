@@ -3,6 +3,14 @@
 // cannot confidently classify as a read counts as a write, so a
 // read-only policy never lets an unrecognized statement through.
 //
+// Classification is lexical, so side effects behind a read shape are
+// invisible to it: SELECT nextval('s'), setval, dblink_exec, or any
+// volatile function called from a SELECT passes as a read. Enforcement
+// that must hold against such statements needs the engine's own
+// read-only mode behind the proxy (a read-only role, or
+// default_transaction_read_only=on); this scanner is the fast
+// pre-filter and the source of clear client-facing errors.
+//
 // The lexer assumes PostgreSQL syntax and must not be pointed at MySQL
 // as is: MySQL block comments do not nest, MySQL executes /*! ... */
 // and treats # as a line comment, and its string literals honor

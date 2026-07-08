@@ -28,6 +28,8 @@ func runProxy(args []string, stdout, stderr io.Writer) int {
 	startupTimeout := fs.Duration("startup-timeout", 10*time.Second, "startup phase limit (negative to disable)")
 	drainTimeout := fs.Duration("drain-timeout", 30*time.Second, "shutdown drain window (0 = wait forever)")
 	maxConns := fs.Int("max-conns", 1024, "max concurrent sessions (0 = unlimited)")
+	writeStallTimeout := fs.Duration("write-stall-timeout", 30*time.Second,
+		"tear down sessions whose client stops draining writes (negative to disable)")
 
 	if err := fs.Parse(args); err != nil {
 		return exit.Usage
@@ -94,11 +96,12 @@ func runProxy(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "tapaside proxy listening on %s, upstream %s\n", l.Addr(), *upstream)
 
 	srv := proxy.Server{
-		Upstream:     *upstream,
-		Handler:      pg.Handler{StartupTimeout: *startupTimeout, Policy: pol},
-		Log:          stderr,
-		MaxConns:     *maxConns,
-		DrainTimeout: *drainTimeout,
+		Upstream:          *upstream,
+		Handler:           pg.Handler{StartupTimeout: *startupTimeout, Policy: pol},
+		Log:               stderr,
+		MaxConns:          *maxConns,
+		DrainTimeout:      *drainTimeout,
+		WriteStallTimeout: *writeStallTimeout,
 	}
 	if err := srv.Serve(ctx, l); err != nil {
 		fmt.Fprintf(stderr, "tapaside: %v\n", err)
@@ -117,11 +120,11 @@ func printProxyUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Listens on loopback for plaintext client connections and relays each")
 	fmt.Fprintln(w, "session to the upstream database, enforcing --policy on each query before")
-	fmt.Fprintln(w, "it reaches the database. Enforcement covers simple queries; while a policy")
-	fmt.Fprintln(w, "is active the extended query protocol (prepared statements) is refused")
-	fmt.Fprintln(w, "rather than relayed, since its SQL is not evaluated yet. With no policy the")
-	fmt.Fprintln(w, "proxy is a transparent relay. The upstream connection is currently plaintext")
-	fmt.Fprintln(w, "TCP; TLS (verify-full) is planned.")
+	fmt.Fprintln(w, "it reaches the database. Enforcement covers simple queries and the extended")
+	fmt.Fprintln(w, "query protocol (prepared statements); fast-path function calls are refused")
+	fmt.Fprintln(w, "while a policy is active. With no policy the proxy is a transparent relay.")
+	fmt.Fprintln(w, "The upstream connection is currently plaintext TCP; TLS (verify-full) is")
+	fmt.Fprintln(w, "planned.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "FLAGS:")
 	fmt.Fprintln(w, "  --listen <addr>          Address to listen on (default: 127.0.0.1:5433)")
@@ -131,5 +134,7 @@ func printProxyUsage(w io.Writer) {
 	fmt.Fprintln(w, "  --drain-timeout <dur>    Shutdown wait, at most twice: graceful, then after a forced")
 	fmt.Fprintln(w, "                           close; 0 = wait forever, never force (default: 30s)")
 	fmt.Fprintln(w, "  --max-conns <n>          Max concurrent sessions; 0 = unlimited (default: 1024)")
+	fmt.Fprintln(w, "  --write-stall-timeout <dur>  Tear down a session when a write to its client makes")
+	fmt.Fprintln(w, "                           no progress for this long; negative to disable (default: 30s)")
 	fmt.Fprintln(w, "  --help, -h               Show this help")
 }

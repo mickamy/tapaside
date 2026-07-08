@@ -98,6 +98,9 @@ type Message struct {
 // IsQuery reports whether m is a simple Query message ('Q').
 func (m Message) IsQuery() bool { return m.Type == 'Q' }
 
+// IsParse reports whether m is an extended-protocol Parse message ('P').
+func (m Message) IsParse() bool { return m.Type == 'P' }
+
 // QueryText returns the SQL of a simple Query message: the payload up
 // to its null terminator. It is meaningful only when IsQuery reports
 // true.
@@ -110,9 +113,39 @@ func (m Message) QueryText() string {
 	return string(s)
 }
 
+// ParseQueryText returns the SQL carried by a Parse message: the query
+// string that follows the statement name in its payload. It is
+// meaningful only when IsParse reports true. A payload missing either
+// null terminator is reported as an error so a caller enforcing a
+// policy can refuse the message instead of evaluating a guess.
+func (m Message) ParseQueryText() (string, error) {
+	_, rest, ok := bytes.Cut(m.Payload, []byte{0})
+	if !ok {
+		return "", errors.New("pgwire: parse message: unterminated statement name")
+	}
+
+	query, _, ok := bytes.Cut(rest, []byte{0})
+	if !ok {
+		return "", errors.New("pgwire: parse message: unterminated query")
+	}
+
+	return string(query), nil
+}
+
 // ErrorResponse builds an ErrorResponse message ('E') with severity
 // ERROR, the given SQLSTATE code, and a human-readable message.
 func ErrorResponse(code, message string) Message {
+	return errorResponse("ERROR", code, message)
+}
+
+// FatalResponse builds an ErrorResponse message ('E') with severity
+// FATAL, the severity a backend uses for errors that end the session
+// during startup.
+func FatalResponse(code, message string) Message {
+	return errorResponse("FATAL", code, message)
+}
+
+func errorResponse(severity, code, message string) Message {
 	var b bytes.Buffer
 
 	field := func(typ byte, val string) {
@@ -121,8 +154,8 @@ func ErrorResponse(code, message string) Message {
 		b.WriteByte(0)
 	}
 
-	field('S', "ERROR")
-	field('V', "ERROR")
+	field('S', severity)
+	field('V', severity)
 	field('C', code)
 	field('M', message)
 	b.WriteByte(0)
@@ -137,34 +170,70 @@ func ReadyForQuery(status byte) Message {
 	return Message{Type: 'Z', Payload: []byte{status}}
 }
 
-// ReadMessage reads one typed message from r.
-func ReadMessage(r io.Reader) (Message, error) {
+// Header is the frame of a typed message, read ahead of its payload so
+// a relay can decide whether to buffer, hold, or stream the rest.
+type Header struct {
+	Type byte
+	// PayloadLen is the payload size in bytes: the wire-format length
+	// minus its own four bytes.
+	PayloadLen int
+}
+
+// ReadHeader reads and validates the five-byte frame of a typed
+// message from r, leaving the payload unread.
+func ReadHeader(r io.Reader) (Header, error) {
 	var head [5]byte
 	if _, err := io.ReadFull(r, head[:]); err != nil {
-		return Message{}, fmt.Errorf("pgwire: read message header: %w", err)
+		return Header{}, fmt.Errorf("pgwire: read message header: %w", err)
 	}
 
 	length := binary.BigEndian.Uint32(head[1:5])
 	if length < 4 || length > maxMessageLength {
-		return Message{}, fmt.Errorf("pgwire: invalid message length %d", length)
+		return Header{}, fmt.Errorf("pgwire: invalid message length %d", length)
 	}
 
-	payload, err := readPayload(r, int(length-4))
+	return Header{Type: head[0], PayloadLen: int(length - 4)}, nil
+}
+
+// Encode returns the header in wire format. It panics on a payload
+// length outside the protocol limit, which a header read from the wire
+// never carries.
+func (h Header) Encode() [5]byte {
+	if h.PayloadLen < 0 || h.PayloadLen > maxMessageLength-4 {
+		panic(fmt.Sprintf("pgwire: invalid payload length %d", h.PayloadLen))
+	}
+
+	var head [5]byte
+
+	head[0] = h.Type
+	binary.BigEndian.PutUint32(head[1:5], uint32(h.PayloadLen+4))
+
+	return head
+}
+
+// ReadMessage reads one typed message from r.
+func ReadMessage(r io.Reader) (Message, error) {
+	hdr, err := ReadHeader(r)
 	if err != nil {
 		return Message{}, err
 	}
 
-	return Message{Type: head[0], Payload: payload}, nil
+	payload, err := ReadPayload(r, hdr.PayloadLen)
+	if err != nil {
+		return Message{}, err
+	}
+
+	return Message{Type: hdr.Type, Payload: payload}, nil
 }
 
-// readPayload reads size bytes from r, growing the buffer as bytes
+// ReadPayload reads size bytes from r, growing the buffer as bytes
 // arrive instead of trusting size up front, so a peer cannot force a
 // large allocation with a small header alone. The buffer doubles on
 // each growth (append-style ~1.25x growth for large slices would copy
 // ~4.5x the payload in total; doubling keeps it at ~1x). A stream that
 // ends mid-payload reports io.ErrUnexpectedEOF, even at a chunk
 // boundary.
-func readPayload(r io.Reader, size int) ([]byte, error) {
+func ReadPayload(r io.Reader, size int) ([]byte, error) {
 	const chunk = 64 << 10
 
 	payload := make([]byte, 0, min(size, chunk))

@@ -62,6 +62,124 @@ func dialProxy(t *testing.T, addr string) net.Conn {
 	return conn
 }
 
+// startSession dials the proxy and completes the plaintext startup.
+func startSession(t *testing.T, addr string) net.Conn {
+	t.Helper()
+
+	client := dialProxy(t, addr)
+
+	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+	if _, err := startup.WriteTo(client); err != nil {
+		t.Fatalf("write startup: %v", err)
+	}
+
+	return client
+}
+
+// startBackend accepts one connection on l and consumes its startup
+// message, handing the connection back for the test to script.
+func startBackend(t *testing.T, l net.Listener) (<-chan net.Conn, <-chan error) {
+	t.Helper()
+
+	connCh := make(chan net.Conn, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			errCh <- fmt.Errorf("accept: %w", err)
+
+			return
+		}
+
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+		if _, err := pgwire.ReadStartup(conn); err != nil {
+			_ = conn.Close()
+			errCh <- fmt.Errorf("read startup: %w", err)
+
+			return
+		}
+
+		connCh <- conn
+	}()
+
+	return connCh, errCh
+}
+
+// backendConn waits for the scripted backend connection.
+func backendConn(t *testing.T, connCh <-chan net.Conn, errCh <-chan error) net.Conn {
+	t.Helper()
+
+	select {
+	case conn := <-connCh:
+		t.Cleanup(func() { _ = conn.Close() })
+
+		return conn
+	case err := <-errCh:
+		t.Fatalf("upstream: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no upstream connection")
+	}
+
+	return nil
+}
+
+// writeMessages writes msgs in order, failing the test on error.
+func writeMessages(t *testing.T, w io.Writer, msgs ...pgwire.Message) {
+	t.Helper()
+
+	for _, m := range msgs {
+		if _, err := m.WriteTo(w); err != nil {
+			t.Fatalf("write message %c: %v", m.Type, err)
+		}
+	}
+}
+
+// expectMessage reads one message from r and fails the test unless it
+// has the wanted type.
+func expectMessage(t *testing.T, r io.Reader, want byte) pgwire.Message {
+	t.Helper()
+
+	m, err := pgwire.ReadMessage(r)
+	if err != nil {
+		t.Fatalf("read message (want %c): %v", want, err)
+	}
+	if m.Type != want {
+		t.Fatalf("message type = %c (payload %q), want %c", m.Type, m.Payload, want)
+	}
+
+	return m
+}
+
+// expectTypes reads one message per wanted type and asserts the order.
+func expectTypes(t *testing.T, r io.Reader, types ...byte) []pgwire.Message {
+	t.Helper()
+
+	msgs := make([]pgwire.Message, 0, len(types))
+	for _, want := range types {
+		msgs = append(msgs, expectMessage(t, r, want))
+	}
+
+	return msgs
+}
+
+// parseMsg builds a Parse message for an unnamed statement with no
+// parameter types.
+func parseMsg(query string) pgwire.Message {
+	return pgwire.Message{Type: 'P', Payload: []byte("\x00" + query + "\x00\x00\x00")}
+}
+
+// Minimal extended-protocol client messages targeting the unnamed
+// statement and portal.
+var (
+	bindUnnamed    = pgwire.Message{Type: 'B', Payload: []byte{0, 0, 0, 0, 0, 0, 0, 0}}
+	describePortal = pgwire.Message{Type: 'D', Payload: []byte{'P', 0}}
+	executeUnnamed = pgwire.Message{Type: 'E', Payload: []byte{0, 0, 0, 0, 0}}
+	syncMsg        = pgwire.Message{Type: 'S'}
+	flushMsg       = pgwire.Message{Type: 'H'}
+)
+
 type upstreamResult struct {
 	startup pgwire.StartupMessage
 	query   pgwire.Message
@@ -365,98 +483,494 @@ func TestHandler_DenyReportsTransactionStatus(t *testing.T) {
 	}
 }
 
-func TestHandler_ReadOnlyRefusesExtendedProtocol(t *testing.T) {
+func TestHandler_ReadOnlyAllowsExtendedRead(t *testing.T) {
 	t.Parallel()
 
 	upstreamL := listen(t)
-
-	// Records the first message the upstream sees after startup. The
-	// refused Parse batch must never reach it, so it must be the SELECT.
-	firstQuery := make(chan pgwire.Message, 1)
-	upErr := make(chan error, 1)
-
-	go func() {
-		conn, err := upstreamL.Accept()
-		if err != nil {
-			upErr <- fmt.Errorf("accept: %w", err)
-
-			return
-		}
-		defer func() { _ = conn.Close() }()
-
-		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-
-		if _, err := pgwire.ReadStartup(conn); err != nil {
-			upErr <- fmt.Errorf("read startup: %w", err)
-
-			return
-		}
-
-		m, err := pgwire.ReadMessage(conn)
-		if err != nil {
-			upErr <- fmt.Errorf("read message: %w", err)
-
-			return
-		}
-
-		firstQuery <- m
-	}()
+	connCh, errCh := startBackend(t, upstreamL)
 
 	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
-	client := dialProxy(t, startProxy(t, upstreamL.Addr().String(), h))
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
 
-	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
-	if _, err := startup.WriteTo(client); err != nil {
-		t.Fatalf("write startup: %v", err)
-	}
+	// A read through the extended protocol: held until Sync, then the
+	// whole batch reaches the backend in order.
+	parse := parseMsg("SELECT id FROM users WHERE id = $1")
+	writeMessages(t, client, parse, bindUnnamed, describePortal, executeUnnamed, syncMsg)
 
-	// An extended-protocol batch: Parse a write, then Sync. Under an
-	// active policy the proxy must refuse the batch, not forward it.
-	parse := pgwire.Message{Type: 'P', Payload: []byte("\x00DELETE FROM users\x00\x00\x00")}
-	if _, err := parse.WriteTo(client); err != nil {
-		t.Fatalf("write parse: %v", err)
-	}
+	backend := backendConn(t, connCh, errCh)
 
-	sync := pgwire.Message{Type: 'S'}
-	if _, err := sync.WriteTo(client); err != nil {
-		t.Fatalf("write sync: %v", err)
+	batch := expectTypes(t, backend, 'P', 'B', 'D', 'E', 'S')
+	if !bytes.Equal(batch[0].Payload, parse.Payload) {
+		t.Errorf("backend Parse payload = %q, want %q", batch[0].Payload, parse.Payload)
 	}
 
-	errResp, err := pgwire.ReadMessage(client)
-	if err != nil {
-		t.Fatalf("read error response: %v", err)
+	// The backend's response flows back to the client.
+	writeMessages(t, backend, pgwire.ReadyForQuery('I'))
+	expectMessage(t, client, 'Z')
+}
+
+func TestHandler_ReadOnlyBlocksExtendedWrite(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// Parse a write: the proxy answers with the policy error and
+	// discards the batch whole.
+	writeMessages(t, client, parseMsg("DELETE FROM users"), bindUnnamed, executeUnnamed, syncMsg)
+
+	errResp := expectMessage(t, client, 'E')
+	if !bytes.Contains(errResp.Payload, []byte("tapaside policy")) {
+		t.Errorf("error payload = %q, want it to mention the policy", errResp.Payload)
 	}
-	if errResp.Type != 'E' {
-		t.Fatalf("response type = %c, want E (ErrorResponse)", errResp.Type)
-	}
-	if !bytes.Contains(errResp.Payload, []byte("extended query protocol")) {
-		t.Errorf("error payload = %q, want it to explain the extended protocol is unsupported", errResp.Payload)
+	if !bytes.Contains(errResp.Payload, []byte("C42501")) {
+		t.Errorf("error payload = %q, want SQLSTATE 42501", errResp.Payload)
 	}
 
-	ready, err := pgwire.ReadMessage(client)
-	if err != nil {
-		t.Fatalf("read ready for query: %v", err)
-	}
-	if ready.Type != 'Z' {
-		t.Errorf("response type = %c, want Z (ReadyForQuery)", ready.Type)
-	}
+	expectMessage(t, client, 'Z')
 
-	// The session survives: a simple read afterward reaches the upstream.
+	// The session survives, and nothing of the batch leaked: the first
+	// thing the backend sees is the read that follows.
 	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
-	if _, err := read.WriteTo(client); err != nil {
-		t.Fatalf("write allowed query: %v", err)
+	writeMessages(t, client, read)
+
+	backend := backendConn(t, connCh, errCh)
+
+	got := expectMessage(t, backend, 'Q')
+	if !bytes.Equal(got.Payload, read.Payload) {
+		t.Errorf("backend first received %q, want the SELECT %q (the batch leaked through)",
+			got.Payload, read.Payload)
+	}
+}
+
+func TestHandler_ExtendedBatchIsAllOrNothing(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// A pipelined batch: an allowed read, then a denied write. The read
+	// was held, so the deny discards the batch whole and the backend
+	// never sees the read either — nothing half-executes.
+	writeMessages(t, client,
+		parseMsg("SELECT 1"), bindUnnamed, executeUnnamed,
+		parseMsg("DELETE FROM users"), bindUnnamed, executeUnnamed,
+		syncMsg,
+	)
+
+	errResp := expectMessage(t, client, 'E')
+	if !bytes.Contains(errResp.Payload, []byte("C42501")) {
+		t.Errorf("error payload = %q, want SQLSTATE 42501", errResp.Payload)
 	}
 
+	ready := expectMessage(t, client, 'Z')
+	if !bytes.Equal(ready.Payload, []byte{'I'}) {
+		t.Errorf("ready status = %q, want I", ready.Payload)
+	}
+
+	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	writeMessages(t, client, read)
+
+	backend := backendConn(t, connCh, errCh)
+
+	got := expectMessage(t, backend, 'Q')
+	if !bytes.Equal(got.Payload, read.Payload) {
+		t.Errorf("backend first received %q, want the SELECT %q (the prefix leaked through)",
+			got.Payload, read.Payload)
+	}
+}
+
+func TestHandler_MalformedParseIsRefused(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// A Parse whose query is missing its terminator cannot be evaluated;
+	// with a policy active it must be refused, not forwarded on a guess.
+	malformed := pgwire.Message{Type: 'P', Payload: []byte("\x00SELECT 1")}
+	writeMessages(t, client, malformed, syncMsg)
+
+	errResp := expectMessage(t, client, 'E')
+	if !bytes.Contains(errResp.Payload, []byte("C08P01")) {
+		t.Errorf("error payload = %q, want SQLSTATE 08P01", errResp.Payload)
+	}
+
+	expectMessage(t, client, 'Z')
+
+	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	writeMessages(t, client, read)
+
+	backend := backendConn(t, connCh, errCh)
+
+	got := expectMessage(t, backend, 'Q')
+	if !bytes.Equal(got.Payload, read.Payload) {
+		t.Errorf("backend first received %q, want the SELECT %q (the Parse leaked through)",
+			got.Payload, read.Payload)
+	}
+}
+
+func TestHandler_FlushReleasesHeldBatch(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// A named-statement prepare that ends in Flush, not Sync: the held
+	// prefix must be released, or the client would wait forever for the
+	// responses it just requested.
+	parse := pgwire.Message{Type: 'P', Payload: []byte("stmt_1\x00SELECT 1\x00\x00\x00")}
+	describe := pgwire.Message{Type: 'D', Payload: []byte("Sstmt_1\x00")}
+	writeMessages(t, client, parse, describe, flushMsg)
+
+	backend := backendConn(t, connCh, errCh)
+	expectTypes(t, backend, 'P', 'D', 'H')
+
+	// The backend's answer reaches the client mid-batch.
+	writeMessages(t, backend, pgwire.Message{Type: '1'}) // ParseComplete
+	expectMessage(t, client, '1')
+
+	// The rest of the batch flows through to its Sync.
+	bind := pgwire.Message{Type: 'B', Payload: []byte("\x00stmt_1\x00\x00\x00\x00\x00\x00\x00")}
+	writeMessages(t, client, bind, executeUnnamed, syncMsg)
+	expectTypes(t, backend, 'B', 'E', 'S')
+
+	writeMessages(t, backend, pgwire.ReadyForQuery('I'))
+	expectMessage(t, client, 'Z')
+}
+
+func TestHandler_DenyAfterFlushResyncsThroughBackend(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// Flush releases the batch prefix to the backend. The deny that
+	// follows can no longer erase the batch, so the client's recovering
+	// Sync must reach the backend, and the backend's own ReadyForQuery —
+	// not a synthesized one — closes the exchange for both ends.
+	writeMessages(t, client, parseMsg("SELECT 1"), flushMsg)
+
+	backend := backendConn(t, connCh, errCh)
+	expectTypes(t, backend, 'P', 'H')
+
+	writeMessages(t, client, parseMsg("DELETE FROM users"), bindUnnamed, executeUnnamed, syncMsg)
+
+	errResp := expectMessage(t, client, 'E')
+	if !bytes.Contains(errResp.Payload, []byte("C42501")) {
+		t.Errorf("error payload = %q, want SQLSTATE 42501", errResp.Payload)
+	}
+
+	// The denied remainder was swallowed; the Sync was forwarded.
+	expectMessage(t, backend, 'S')
+
+	writeMessages(t, backend, pgwire.ReadyForQuery('I'))
+	expectMessage(t, client, 'Z')
+}
+
+func TestHandler_OversizedBatchIsReleasedEarly(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// A Bind larger than the hold budget: the batch is released before
+	// its Sync so held memory stays bounded.
+	bigBind := pgwire.Message{Type: 'B', Payload: make([]byte, pg.MaxHeldBytes+1)}
+	writeMessages(t, client, parseMsg("SELECT 1"), bigBind)
+
+	backend := backendConn(t, connCh, errCh)
+
+	got := expectTypes(t, backend, 'P', 'B')
+	if len(got[1].Payload) != pg.MaxHeldBytes+1 {
+		t.Errorf("backend Bind payload = %d bytes, want %d", len(got[1].Payload), pg.MaxHeldBytes+1)
+	}
+}
+
+func TestHandler_ReadOnlyRefusesFastPath(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// A fast-path call names a function by OID, not by SQL: there is
+	// nothing to evaluate, so refusing it is the only guard against
+	// invoking a write function while a policy is active.
+	fastPath := pgwire.Message{Type: 'F', Payload: []byte{0, 0, 0, 1, 0, 0, 0, 0}}
+	writeMessages(t, client, fastPath)
+
+	errResp := expectMessage(t, client, 'E')
+	if !bytes.Contains(errResp.Payload, []byte("C0A000")) {
+		t.Errorf("error payload = %q, want SQLSTATE 0A000", errResp.Payload)
+	}
+
+	expectMessage(t, client, 'Z')
+
+	// The session survives and the call never reached the backend.
+	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	writeMessages(t, client, read)
+
+	backend := backendConn(t, connCh, errCh)
+
+	got := expectMessage(t, backend, 'Q')
+	if !bytes.Equal(got.Payload, read.Payload) {
+		t.Errorf("backend first received %q, want the SELECT %q (the fast-path call leaked through)",
+			got.Payload, read.Payload)
+	}
+}
+
+func TestHandler_OversizedParseIsStillEvaluated(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// A write Parse bigger than the retained scratch takes the one-off
+	// buffer path; its SQL must still be evaluated, never streamed past
+	// the policy.
+	query := "DELETE FROM users WHERE note = '" + strings.Repeat("x", 80<<10) + "'"
+	writeMessages(t, client, parseMsg(query), syncMsg)
+
+	errResp := expectMessage(t, client, 'E')
+	if !bytes.Contains(errResp.Payload, []byte("C42501")) {
+		t.Errorf("error payload = %q, want SQLSTATE 42501", errResp.Payload)
+	}
+
+	expectMessage(t, client, 'Z')
+
+	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	writeMessages(t, client, read)
+
+	backend := backendConn(t, connCh, errCh)
+
+	got := expectMessage(t, backend, 'Q')
+	if !bytes.Equal(got.Payload, read.Payload) {
+		t.Errorf("backend first received %q, want the SELECT %q (the Parse leaked through)",
+			got.Payload, read.Payload)
+	}
+}
+
+func TestHandler_LargeUninspectedMessageStreamsThrough(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		h    pg.Handler
+	}{
+		{name: "transparent relay", h: pg.Handler{}},
+		{name: "policy active", h: pg.Handler{Policy: policy.Policy{ReadOnly: true}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			upstreamL := listen(t)
+			connCh, errCh := startBackend(t, upstreamL)
+
+			client := startSession(t, startProxy(t, upstreamL.Addr().String(), tt.h))
+
+			// Larger than the retained scratch, so the relay takes the
+			// streaming path; the message must arrive upstream intact.
+			payload := bytes.Repeat([]byte("0123456789abcdef"), (200<<10)/16)
+			writeMessages(t, client, pgwire.Message{Type: 'd', Payload: payload})
+
+			backend := backendConn(t, connCh, errCh)
+
+			got := expectMessage(t, backend, 'd')
+			if !bytes.Equal(got.Payload, payload) {
+				t.Errorf("backend payload = %d bytes, want %d bytes intact", len(got.Payload), len(payload))
+			}
+		})
+	}
+}
+
+func TestHandler_DeniedBatchDiscardsLargeMessages(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// A denied write followed by its bulk Bind: the swallowed remainder
+	// must not wedge the recovery, and nothing of it may leak upstream.
+	bigBind := pgwire.Message{Type: 'B', Payload: make([]byte, 200<<10)}
+	writeMessages(t, client, parseMsg("INSERT INTO t VALUES ($1)"), bigBind, executeUnnamed, syncMsg)
+
+	errResp := expectMessage(t, client, 'E')
+	if !bytes.Contains(errResp.Payload, []byte("C42501")) {
+		t.Errorf("error payload = %q, want SQLSTATE 42501", errResp.Payload)
+	}
+
+	expectMessage(t, client, 'Z')
+
+	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	writeMessages(t, client, read)
+
+	backend := backendConn(t, connCh, errCh)
+
+	got := expectMessage(t, backend, 'Q')
+	if !bytes.Equal(got.Payload, read.Payload) {
+		t.Errorf("backend first received %q, want the SELECT %q (the batch leaked through)",
+			got.Payload, read.Payload)
+	}
+}
+
+func TestHandler_QueryInterruptedBatchDeniesWithSynthesizedReady(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// Open a transaction; the backend reports 'T'.
+	writeMessages(t, client, pgwire.Message{Type: 'Q', Payload: []byte("BEGIN\x00")})
+
+	backend := backendConn(t, connCh, errCh)
+	expectMessage(t, backend, 'Q')
+	writeMessages(t, backend, pgwire.ReadyForQuery('T'))
+	expectMessage(t, client, 'Z')
+
+	// A simple query interrupts an open batch: the held Parse is
+	// released and the query's own exchange answers through the
+	// backend's ReadyForQuery, leaving nothing pending upstream.
+	writeMessages(t, client, parseMsg("SELECT 1"), pgwire.Message{Type: 'Q', Payload: []byte("SELECT 2\x00")})
+	expectTypes(t, backend, 'P', 'Q')
+	writeMessages(t, backend, pgwire.ReadyForQuery('T'))
+	expectMessage(t, client, 'Z')
+
+	// A denied batch after the interruption must synthesize its whole
+	// exchange — failed-transaction status included — not resync through
+	// the backend on the strength of the earlier release.
+	writeMessages(t, client, parseMsg("UPDATE t SET x = 1"), syncMsg)
+
+	expectMessage(t, client, 'E')
+
+	denyReady := expectMessage(t, client, 'Z')
+	if !bytes.Equal(denyReady.Payload, []byte{'E'}) {
+		t.Errorf("ready after deny = %q, want E (in-transaction deny)", denyReady.Payload)
+	}
+
+	// And the swallowed Sync stays swallowed: the backend sees none of it.
+	_ = backend.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := pgwire.ReadMessage(backend); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("backend read = %v, want a deadline timeout (nothing forwarded)", err)
+	}
+}
+
+func TestHandler_StalledClientWithDenyIsTornDown(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	// A short write-stall guard so the wedge resolves within the test.
+	l := listen(t)
+	srv := proxy.Server{
+		Upstream:          upstreamL.Addr().String(),
+		Handler:           pg.Handler{Policy: policy.Policy{ReadOnly: true}},
+		WriteStallTimeout: 100 * time.Millisecond,
+	}
+	go func() { _ = srv.Serve(t.Context(), l) }()
+
+	client := startSession(t, l.Addr().String())
+
+	// The adversarial shape: pipeline a read whose response is huge and
+	// a write the policy denies, then stop reading entirely. The deny
+	// waits on the client write lock while the response copy holds it,
+	// blocked on the non-reading client — without the guard, the
+	// session and the upstream connection wedge forever.
+	writeMessages(t, client,
+		pgwire.Message{Type: 'Q', Payload: []byte("SELECT big\x00")},
+		pgwire.Message{Type: 'Q', Payload: []byte("DELETE FROM users\x00")},
+	)
+
+	backend := backendConn(t, connCh, errCh)
+	expectMessage(t, backend, 'Q') // the SELECT arrives
+
+	// The backend answers with more than every buffer on the path can
+	// absorb, so the relay's copy to the client must stall.
+	big := pgwire.Message{Type: 'D', Payload: make([]byte, 8<<20)}
+	wrote := make(chan error, 1)
+
+	go func() {
+		_, err := big.WriteTo(backend)
+		wrote <- err
+	}()
+
+	// Teardown unblocks the backend's write; a wedged session would
+	// leave it blocked forever.
 	select {
-	case err := <-upErr:
-		t.Fatalf("upstream: %v", err)
-	case got := <-firstQuery:
-		if !bytes.Equal(got.Payload, read.Payload) {
-			t.Errorf("upstream first received %q, want the SELECT %q (the Parse leaked through)",
-				got.Payload, read.Payload)
-		}
+	case <-wrote:
 	case <-time.After(5 * time.Second):
-		t.Fatal("upstream received no message")
+		t.Fatal("backend write still blocked; the session wedged instead of tearing down")
+	}
+
+	// And the upstream connection is released, not leaked.
+	_ = backend.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := backend.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("backend read after stall = %v, want the connection closed", err)
+	}
+}
+
+func TestHandler_ExtendedDenyReportsTransactionStatus(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// Open a transaction; the backend reports 'T'.
+	writeMessages(t, client, pgwire.Message{Type: 'Q', Payload: []byte("BEGIN\x00")})
+
+	backend := backendConn(t, connCh, errCh)
+	expectMessage(t, backend, 'Q')
+	writeMessages(t, backend, pgwire.ReadyForQuery('T'))
+
+	ready := expectMessage(t, client, 'Z')
+	if !bytes.Equal(ready.Payload, []byte{'T'}) {
+		t.Fatalf("ready after begin = %q, want T", ready.Payload)
+	}
+
+	// A denied Parse inside the transaction: the synthesized
+	// ReadyForQuery must report the failed state 'E', not 'I'.
+	writeMessages(t, client, parseMsg("UPDATE t SET x = 1"), syncMsg)
+
+	expectMessage(t, client, 'E')
+
+	denyReady := expectMessage(t, client, 'Z')
+	if !bytes.Equal(denyReady.Payload, []byte{'E'}) {
+		t.Errorf("ready after deny = %q, want E (in-transaction deny)", denyReady.Payload)
 	}
 }
 
@@ -712,6 +1226,44 @@ func TestHandler_TooManyEncryptionRequests(t *testing.T) {
 	buf := make([]byte, 1)
 	if _, err := client.Read(buf); !errors.Is(err, io.EOF) {
 		t.Errorf("read after limit = %v, want io.EOF", err)
+	}
+}
+
+func TestHandler_GSSEncRequestDenied(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	client := dialProxy(t, startProxy(t, upstreamL.Addr().String(), pg.Handler{}))
+
+	// GSSAPI encryption, like SSL, is denied with 'N': the client side
+	// of the sidecar is plaintext by design. The session then proceeds.
+	if _, err := (pgwire.StartupMessage{Code: pgwire.GSSEncRequestCode}).WriteTo(client); err != nil {
+		t.Fatalf("write gssenc request: %v", err)
+	}
+
+	deny := make([]byte, 1)
+	if _, err := io.ReadFull(client, deny); err != nil {
+		t.Fatalf("read gssenc response: %v", err)
+	}
+	if deny[0] != 'N' {
+		t.Fatalf("gssenc response = %q, want 'N'", deny[0])
+	}
+
+	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
+	if _, err := startup.WriteTo(client); err != nil {
+		t.Fatalf("write startup: %v", err)
+	}
+
+	read := pgwire.Message{Type: 'Q', Payload: []byte("SELECT 1\x00")}
+	writeMessages(t, client, read)
+
+	backend := backendConn(t, connCh, errCh)
+
+	got := expectMessage(t, backend, 'Q')
+	if !bytes.Equal(got.Payload, read.Payload) {
+		t.Errorf("backend received %q, want the SELECT %q", got.Payload, read.Payload)
 	}
 }
 
@@ -1008,15 +1560,46 @@ func TestHandler_UpstreamUnreachable(t *testing.T) {
 	addr := l.Addr().String()
 	_ = l.Close()
 
-	client := dialProxy(t, startProxy(t, addr, pg.Handler{}))
+	client := startSession(t, startProxy(t, addr, pg.Handler{}))
 
-	startup := pgwire.StartupMessage{Code: 196608, Payload: []byte("user\x00alice\x00\x00")}
-	if _, err := startup.WriteTo(client); err != nil {
-		t.Fatalf("write startup: %v", err)
+	// The client must learn why the session ends: a FATAL error the way
+	// a backend reports its own startup failures, then the close.
+	errResp := expectMessage(t, client, 'E')
+	if !bytes.Contains(errResp.Payload, []byte("SFATAL")) {
+		t.Errorf("error payload = %q, want severity FATAL", errResp.Payload)
+	}
+	if !bytes.Contains(errResp.Payload, []byte("C08006")) {
+		t.Errorf("error payload = %q, want SQLSTATE 08006", errResp.Payload)
+	}
+	if !bytes.Contains(errResp.Payload, []byte("upstream database is unreachable")) {
+		t.Errorf("error payload = %q, want it to name the upstream failure", errResp.Payload)
 	}
 
 	buf := make([]byte, 1)
 	if _, err := client.Read(buf); !errors.Is(err, io.EOF) {
-		t.Errorf("read after dial failure = %v, want io.EOF", err)
+		t.Errorf("read after error = %v, want io.EOF", err)
+	}
+}
+
+func TestHandler_UpstreamUnreachableCancelRequest(t *testing.T) {
+	t.Parallel()
+
+	// Reserve an address, then close the listener so nothing accepts on it.
+	l := listen(t)
+	addr := l.Addr().String()
+	_ = l.Close()
+
+	client := dialProxy(t, startProxy(t, addr, pg.Handler{}))
+
+	// A cancel request expects no response, dial failure included: the
+	// connection just closes without a synthesized error.
+	cancel := pgwire.StartupMessage{Code: pgwire.CancelRequestCode, Payload: []byte{0, 0, 0, 1, 0, 0, 0, 2}}
+	if _, err := cancel.WriteTo(client); err != nil {
+		t.Fatalf("write cancel request: %v", err)
+	}
+
+	buf := make([]byte, 1)
+	if _, err := client.Read(buf); !errors.Is(err, io.EOF) {
+		t.Errorf("read after cancel dial failure = %v, want io.EOF (no error response)", err)
 	}
 }
