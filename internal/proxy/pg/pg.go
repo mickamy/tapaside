@@ -409,10 +409,24 @@ func (f *msgFilter) handle(hdr pgwire.Header) error {
 
 		m := pgwire.Message{Type: hdr.Type, Payload: payload}
 		if res := f.pol.Evaluate(m.QueryText()); res.Decision == policy.Blocked {
+			// The held prefix stays released and unanswered upstream, so
+			// prefixForwarded must survive this deny: a later deny still
+			// has to resync through the backend.
 			return f.denyQuery(res)
 		}
 
-		return f.forwardBuffered(hdr, payload)
+		if err := f.forwardBuffered(hdr, payload); err != nil {
+			return err
+		}
+
+		// A forwarded simple query runs through the backend's own
+		// ReadyForQuery, which flushes whatever the batch had released;
+		// nothing stays pending upstream, so a deny in a later batch can
+		// synthesize its whole exchange again (and report the true
+		// transaction status) instead of resyncing through the backend.
+		f.prefixForwarded = false
+
+		return nil
 	case msgParse:
 		payload, err := f.inspectPayload(hdr)
 		if err != nil {

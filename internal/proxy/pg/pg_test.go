@@ -842,6 +842,50 @@ func TestHandler_DeniedBatchDiscardsLargeMessages(t *testing.T) {
 	}
 }
 
+func TestHandler_QueryInterruptedBatchDeniesWithSynthesizedReady(t *testing.T) {
+	t.Parallel()
+
+	upstreamL := listen(t)
+	connCh, errCh := startBackend(t, upstreamL)
+
+	h := pg.Handler{Policy: policy.Policy{ReadOnly: true}}
+	client := startSession(t, startProxy(t, upstreamL.Addr().String(), h))
+
+	// Open a transaction; the backend reports 'T'.
+	writeMessages(t, client, pgwire.Message{Type: 'Q', Payload: []byte("BEGIN\x00")})
+
+	backend := backendConn(t, connCh, errCh)
+	expectMessage(t, backend, 'Q')
+	writeMessages(t, backend, pgwire.ReadyForQuery('T'))
+	expectMessage(t, client, 'Z')
+
+	// A simple query interrupts an open batch: the held Parse is
+	// released and the query's own exchange answers through the
+	// backend's ReadyForQuery, leaving nothing pending upstream.
+	writeMessages(t, client, parseMsg("SELECT 1"), pgwire.Message{Type: 'Q', Payload: []byte("SELECT 2\x00")})
+	expectTypes(t, backend, 'P', 'Q')
+	writeMessages(t, backend, pgwire.ReadyForQuery('T'))
+	expectMessage(t, client, 'Z')
+
+	// A denied batch after the interruption must synthesize its whole
+	// exchange — failed-transaction status included — not resync through
+	// the backend on the strength of the earlier release.
+	writeMessages(t, client, parseMsg("UPDATE t SET x = 1"), syncMsg)
+
+	expectMessage(t, client, 'E')
+
+	denyReady := expectMessage(t, client, 'Z')
+	if !bytes.Equal(denyReady.Payload, []byte{'E'}) {
+		t.Errorf("ready after deny = %q, want E (in-transaction deny)", denyReady.Payload)
+	}
+
+	// And the swallowed Sync stays swallowed: the backend sees none of it.
+	_ = backend.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := pgwire.ReadMessage(backend); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("backend read = %v, want a deadline timeout (nothing forwarded)", err)
+	}
+}
+
 func TestHandler_StalledClientWithDenyIsTornDown(t *testing.T) {
 	t.Parallel()
 
